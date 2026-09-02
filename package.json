@@ -1,0 +1,19 @@
+{
+  "name": "career-mail-tracker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first recruitment tracker with incremental email analysis.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --test",
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "imapflow": "^1.7.1",
+    "mailparser": "^3.9.15"
+  }
+}

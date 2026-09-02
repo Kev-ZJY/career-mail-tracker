@@ -1,0 +1,20 @@
+node_modules/
+data/
+.env
+.DS_Store
+npm-debug.log*
+data/.secrets/
+.playwright-mcp/
+*.png
+# 本地运行数据与内部文档，不上传远端仓库
+docs/
+.workbuddy/
+
+# 一次性评测与联调产物，不入库
+outputs/
+test-openrouter.mjs
+scripts/agent-a-triage-llm.mjs
+scripts/agent-b-full-llm.mjs
+scripts/agent-b-sampled.mjs
+scripts/agent-b-sampled-60.mjs
+scripts/replay-to-db.mjs
