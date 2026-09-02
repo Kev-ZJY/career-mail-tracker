@@ -6,6 +6,9 @@ npm-debug.log*
 data/.secrets/
 .playwright-mcp/
 *.png
+# README 展示截图例外（其他 *.png 仍忽略）
+!/assets/
+!/assets/*.png
 # 本地运行数据与内部文档，不上传远端仓库
 docs/
 .workbuddy/

@@ -4,6 +4,8 @@
 
 数据全部保存在本机 SQLite，不经过任何第三方服务器；只有「邮件内容分析」这一步会调用你主动配置的云端模型（OpenRouter / DeepSeek / OpenAI 兼容接口，也可以接本地 Ollama）。
 
+![Career Mail Tracker 看板示例](assets/dashboard.png)
+
 ---
 
 ## 功能特性
