@@ -256,7 +256,7 @@ export function createApi({
         const company = typeof input.company === 'string' ? input.company.trim() : '';
         const position = typeof input.position === 'string' ? input.position.trim() : '';
         const eventStart = input.eventStart || input.receivedAt;
-        if (!company || !position || !ALLOWED_PROGRESS_STATUSES.has(input.status)) throw new Error('company, position, and status are required');
+        if (!company || !ALLOWED_PROGRESS_STATUSES.has(input.status)) throw new Error('company and status are required');
         if (!eventStart || !Number.isFinite(Date.parse(eventStart))) throw new Error('eventStart is invalid');
         if (input.eventEnd && (!Number.isFinite(Date.parse(input.eventEnd)) || Date.parse(input.eventEnd) < Date.parse(eventStart))) throw new Error('eventEnd is invalid');
         const row = repository.updateThread(Number(editMatch[1]), {
