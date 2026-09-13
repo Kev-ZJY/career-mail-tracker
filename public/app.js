@@ -1,4 +1,4 @@
-import { buildMonthGrid, dateKey, eventDateKeys, formatDateRange, formatTime, parseDateKey } from './calendar-model.js';
+import { buildMonthGrid, dateKey, eventDateKeys, formatDateRange, formatEmailTabLabel, formatSenderDisplay, formatTime, parseDateKey } from './calendar-model.js';
 
 const WINDOW_START_KEY = 'career-mail-tracker.window-start';
 const state = {
@@ -7,6 +7,7 @@ const state = {
   calendarRows: [],
   selectedProvider: null,
   selectedRows: new Set(),
+  emailReader: { row: null, messages: [] },
   calendar: { year: new Date().getFullYear(), month: new Date().getMonth(), selectedDate: null },
 };
 
@@ -95,10 +96,7 @@ function renderMetrics() {
 }
 
 function formatNotes(row) {
-  if (row.notes) return row.notes;
-  const notes = [row.evidence || '邮件中未提取到备注'];
-  if (row.needsReview || Number(row.confidence) < 0.75) notes.push('低置信度 · 建议人工确认');
-  return notes.join(' · ');
+  return row.notes || '';
 }
 
 function renderRows() {
@@ -113,7 +111,7 @@ function renderRows() {
     const emailCell = row.latestMessageId == null
       ? '<span class="email-link email-manual">手动记录</span>'
       : `<button class="email-link" type="button" data-email-id="${row.latestMessageId}" data-thread-id="${row.id}">查看邮件 ↗</button>`;
-    return `<tr data-row-id="${row.id}"><td class="check-column"><label class="check-wrap"><input class="row-check" type="checkbox" data-row-id="${row.id}" ${state.selectedRows.has(row.id) ? 'checked' : ''} /><span></span></label></td><td class="company-cell"><strong>${escapeHtml(row.company || '未识别公司')}</strong>${row.source === 'manual' ? '<span class="source-label">手动</span>' : ''}</td><td class="position-cell">${escapeHtml(row.position || '未识别职位')}</td><td><span class="status-chip ${statusTone(row.status)}">${escapeHtml(row.status)}</span></td><td class="date-cell">${formatDateRange(window.start, window.end)}</td><td class="notes-cell">${escapeHtml(formatNotes(row))}</td><td>${emailCell}</td><td class="action-column"><button class="row-edit" type="button" data-edit-id="${row.id}" aria-label="编辑 ${escapeAttr(row.company || '')}">编辑</button></td></tr>`;
+    return `<tr data-row-id="${row.id}"><td class="check-column"><label class="check-wrap"><input class="row-check" type="checkbox" data-row-id="${row.id}" ${state.selectedRows.has(row.id) ? 'checked' : ''} /><span></span></label></td><td class="company-cell"><strong>${escapeHtml(row.company || '未识别公司')}</strong>${row.source === 'manual' ? '<span class="source-label">手动</span>' : ''}</td><td class="position-cell">${escapeHtml(row.position || '未识别岗位')}${row.manualPositionOverride ? '<span class="source-label">人工修正</span>' : ''}</td><td><span class="status-chip ${statusTone(row.status)}">${escapeHtml(row.status)}</span></td><td class="date-cell">${formatDateRange(window.start, window.end)}</td><td class="notes-cell">${escapeHtml(formatNotes(row))}</td><td>${emailCell}</td><td class="action-column"><button class="row-edit" type="button" data-edit-id="${row.id}" aria-label="编辑 ${escapeAttr(row.company || '')}">编辑</button></td></tr>`;
   }).join('');
   updateSelectionUI();
 }
@@ -165,39 +163,62 @@ function openDialog(id) { const dialog = $(`#${id}`); if (!dialog.open) dialog.s
 function closeDialog(id) { const dialog = $(`#${id}`); if (dialog.open) dialog.close(); }
 function fillEditor(row = null) { const form = $('#manualForm'); form.reset(); form.elements.position.required = !row; form.elements.id.value = row?.id || ''; form.elements.company.value = row?.company || ''; form.elements.position.value = row?.position || ''; form.elements.status.value = row?.status || '面试'; const window = row ? getEventWindow(row) : getEventWindow({ status: '面试', receivedAt: new Date().toISOString() }); form.elements.eventStart.value = toLocalDateTime(window.start); form.elements.eventEnd.value = window.end && !window.allDay ? toLocalDateTime(window.end) : (window.end ? toLocalDateTime(window.end) : ''); form.elements.notes.value = row ? formatNotes(row) : ''; $('#progressDialogTitle').textContent = row ? '编辑招聘进展' : '添加一条进展'; openDialog('manualDialog'); }
 
+function renderEmailMessage(index) {
+  const row = state.emailReader.row;
+  const detail = state.emailReader.messages[index];
+  if (!row || !detail) return;
+  $$('#emailHistoryTabs [data-email-history-index]').forEach((button) => {
+    const active = Number(button.dataset.emailHistoryIndex) === index;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+  const sender = formatSenderDisplay(detail.sender);
+  const subject = detail.subject || `${row.company || '招聘'}${row.position ? ` · ${row.position}` : ''}进展通知`;
+  const receivedAt = formatDateTime(detail.receivedAt || row.latestReceivedAt || row.receivedAt);
+  $('#emailSender').textContent = sender;
+  $('#emailSender').title = sender;
+  $('#emailSubject').textContent = subject;
+  $('#emailSubject').title = subject;
+  $('#emailReceivedAt').textContent = receivedAt;
+  $('#emailReceivedAt').title = receivedAt;
+  const bodyHost = $('#emailBody');
+  if (detail.bodyHtml) {
+    bodyHost.innerHTML = '';
+    const frame = document.createElement('iframe');
+    frame.className = 'email-frame';
+    frame.setAttribute('sandbox', '');
+    frame.referrerPolicy = 'no-referrer';
+    bodyHost.appendChild(frame);
+    frame.srcdoc = detail.bodyHtml;
+  } else if (detail.bodyText) {
+    const textNode = document.createElement('div');
+    textNode.className = 'email-body-text';
+    textNode.textContent = detail.bodyText;
+    bodyHost.innerHTML = '';
+    bodyHost.appendChild(textNode);
+  } else {
+    bodyHost.innerHTML = '<div class="email-body-empty">本地未保存这封邮件的正文。</div>';
+  }
+}
+
 async function openEmail(row) {
   if (!row) return;
+  state.emailReader = { row, messages: [] };
+  $('#emailHistoryTabs').innerHTML = '<span class="email-history-loading">正在读取邮件历史…</span>';
   $('#emailSender').textContent = '招聘团队';
   $('#emailSubject').textContent = `${row.company || '招聘'}${row.position ? ` · ${row.position}` : ''}进展通知`;
   $('#emailReceivedAt').textContent = formatDateTime(row.latestReceivedAt || row.receivedAt);
-  const bodyHost = $('#emailBody');
-  bodyHost.innerHTML = '<div class="email-body-empty">正在读取原始邮件…</div>';
-  $('#openMailboxLink').href = row.provider === 'netease' ? 'https://email.163.com/' : 'https://mail.qq.com/';
+  $('#emailBody').innerHTML = '<div class="email-body-empty">正在读取原始邮件…</div>';
   openDialog('emailReaderDialog');
   try {
-    const detail = await api(`/api/progress/${row.latestMessageId}/email`);
-    $('#emailSender').textContent = detail.sender || '招聘团队';
-    $('#emailSubject').textContent = detail.subject || $('#emailSubject').textContent;
-    $('#emailReceivedAt').textContent = formatDateTime(detail.receivedAt || row.latestReceivedAt || row.receivedAt);
-    if (detail.bodyHtml) {
-      bodyHost.innerHTML = '';
-      const frame = document.createElement('iframe');
-      frame.className = 'email-frame';
-      frame.setAttribute('sandbox', '');
-      frame.referrerPolicy = 'no-referrer';
-      bodyHost.appendChild(frame);
-      frame.srcdoc = detail.bodyHtml;
-    } else if (detail.bodyText) {
-      const textNode = document.createElement('div');
-      textNode.className = 'email-body-text';
-      textNode.textContent = detail.bodyText;
-      bodyHost.innerHTML = '';
-      bodyHost.appendChild(textNode);
-    }
-    $('#emailLinkHint').textContent = row.webUrl || detail.webUrl ? '以下方按钮打开邮箱查看原邮件' : 'IMAP 只提供邮件身份，打开邮箱后可用主题搜索原邮件';
+    const history = await api(`/api/progress/${row.id}/emails`);
+    state.emailReader.messages = history.messages || [];
+    if (!state.emailReader.messages.length) throw new Error('邮件历史为空');
+    $('#emailHistoryTabs').innerHTML = state.emailReader.messages.map((mail, index) => `<button class="email-history-tab ${index === 0 ? 'active' : ''}" type="button" data-email-history-index="${index}" aria-pressed="${index === 0}">${escapeHtml(formatEmailTabLabel(mail.receivedAt))}</button>`).join('');
+    renderEmailMessage(0);
   } catch {
-    bodyHost.innerHTML = '<div class="email-body-empty">本地未保存这封邮件的正文。<br />可点击下方按钮到邮箱中按主题搜索原邮件。</div>';
-    $('#emailLinkHint').textContent = 'IMAP 只提供邮件身份，打开邮箱后可用主题搜索原邮件';
+    $('#emailHistoryTabs').innerHTML = '';
+    $('#emailBody').innerHTML = '<div class="email-body-empty">本地未保存这条申请的邮件正文。<br />可到邮箱中按主题搜索原邮件。</div>';
   }
 }
 
@@ -220,7 +241,9 @@ async function syncCurrentWindow({ auto = false } = {}) {
   try {
     const result = await api('/api/sync/run', { method: 'POST', body });
     await Promise.all([refreshDashboard(), refreshCalendarData()]);
-    if (result.modelFailed > 0) showNotice('部分邮件分析失败，请检查模型配置后重试', 'warn');
+    const rateLimited = result.failures?.some((failure) => failure.error === 'MODEL_RATE_LIMITED');
+    if (rateLimited) showNotice('模型额度或调用频率已达上限；未处理邮件会在下次同步时继续分析。', 'warn');
+    else if (result.modelFailed > 0) showNotice('部分邮件分析失败，请检查模型配置后重试', 'warn');
     else if (!auto || result.inserted > 0) showNotice(`同步完成：新增 ${result.inserted} 条，跳过 ${result.skipped} 条。`);
   } catch (error) {
     if (error.code === 'MODEL_UNAVAILABLE') {
@@ -272,10 +295,11 @@ $('#calendarMonth').addEventListener('change', (event) => { state.calendar.month
 $('#calendarGrid').addEventListener('click', (event) => { const date = event.target.closest('[data-calendar-date]')?.dataset.calendarDate; if (date) openDayDetail(date); });
 $('#calendarBack').addEventListener('click', closeDayDetail);
 $('#dayDetailTimeline').addEventListener('click', (event) => { const emailButton = event.target.closest('[data-thread-id]'); if (emailButton) openEmail(allDisplayRows().find((row) => String(row.id) === emailButton.dataset.threadId)); });
+$('#emailHistoryTabs').addEventListener('click', (event) => { const button = event.target.closest('[data-email-history-index]'); if (button) renderEmailMessage(Number(button.dataset.emailHistoryIndex)); });
 
 $('#providerForm').addEventListener('submit', async (event) => { event.preventDefault(); try { await api('/api/settings/provider', { method: 'POST', body: Object.fromEntries(new FormData(event.currentTarget)) }); await refreshSettings(); event.currentTarget.querySelector('[name="apiKey"]').value = ''; showNotice('模型配置已保存。API key 只在当前进程内保留。'); } catch (error) { showNotice(error.message, 'error'); } });
 $('#mailboxForm').addEventListener('submit', async (event) => { event.preventDefault(); try { await api('/api/settings/mailbox', { method: 'POST', body: Object.fromEntries(new FormData(event.currentTarget)) }); await refreshSettings(); event.currentTarget.querySelector('[name="authorizationCode"]').value = ''; showNotice('邮箱连接草稿已保存。'); } catch (error) { showNotice(error.message, 'error'); } });
-$('#manualForm').addEventListener('submit', async (event) => { event.preventDefault(); const formEl = event.currentTarget; const form = new FormData(formEl); const id = form.get('id'); const values = Object.fromEntries(form); if (values.eventEnd && values.eventEnd < values.eventStart) { showNotice('结束时间不能早于开始时间。', 'error'); return; } try { if (id) { await api(`/api/progress/${id}`, { method: 'PUT', body: { company: values.company, position: values.position, status: values.status, eventStart: new Date(values.eventStart).toISOString(), eventEnd: values.eventEnd ? new Date(values.eventEnd).toISOString() : null, notes: values.notes, evidence: values.notes || '手动更新', nextAction: '由用户手动维护' } }); await refreshAll(); showNotice('这条进展已更新。'); } else { await api('/api/progress/manual', { method: 'POST', body: { company: values.company, position: values.position, status: values.status, receivedAt: values.eventStart, evidence: values.notes || '手动记录', nextAction: '由用户手动维护' } }); await refreshAll(); showNotice('手动进展已添加。'); } closeDialog('manualDialog'); formEl.reset(); } catch (error) { showNotice(error.message, 'error'); } });
+$('#manualForm').addEventListener('submit', async (event) => { event.preventDefault(); const formEl = event.currentTarget; const form = new FormData(formEl); const id = form.get('id'); const values = Object.fromEntries(form); if (values.eventEnd && values.eventEnd < values.eventStart) { showNotice('结束时间不能早于开始时间。', 'error'); return; } try { if (id) { await api(`/api/progress/${id}`, { method: 'PUT', body: { company: values.company, position: values.position, status: values.status, eventStart: new Date(values.eventStart).toISOString(), eventEnd: values.eventEnd ? new Date(values.eventEnd).toISOString() : null, notes: values.notes } }); await refreshAll(); showNotice('这条进展已更新。'); } else { await api('/api/progress/manual', { method: 'POST', body: { company: values.company, position: values.position, status: values.status, receivedAt: values.eventStart, eventStart: new Date(values.eventStart).toISOString(), eventEnd: values.eventEnd ? new Date(values.eventEnd).toISOString() : null, notes: values.notes, evidence: '用户手动记录', nextAction: '由用户手动维护' } }); await refreshAll(); showNotice('手动进展已添加。'); } closeDialog('manualDialog'); formEl.reset(); } catch (error) { showNotice(error.message, 'error'); } });
 
 setInitialWindow();
 refreshAll().then(() => {

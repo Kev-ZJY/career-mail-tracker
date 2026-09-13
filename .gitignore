@@ -1,17 +1,24 @@
 node_modules/
 data/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.xlsx
+*.csv
+*.eml
+*.mbox
 .env
 .DS_Store
 npm-debug.log*
 data/.secrets/
 .playwright-mcp/
 *.png
-# README 展示截图例外（其他 *.png 仍忽略）
-!/assets/
-!/assets/*.png
 # 本地运行数据与内部文档，不上传远端仓库
 docs/
 .workbuddy/
+test/
+scripts/
 
 # 一次性评测与联调产物，不入库
 outputs/

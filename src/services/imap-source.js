@@ -24,7 +24,12 @@ function dateOnlyEndExclusive(value) {
 }
 
 function formatSender(from = []) {
-  const sender = Array.isArray(from) ? from[0] : from;
+  const candidates = Array.isArray(from)
+    ? from
+    : Array.isArray(from?.value)
+      ? from.value
+      : [from];
+  const sender = candidates.find((candidate) => candidate?.address || candidate?.name);
   if (!sender) return '';
   const address = sender.address || '';
   const name = sender.name || '';
@@ -60,9 +65,8 @@ async function defaultParser(source) {
   return simpleParser(source, { skipHtmlToText: false });
 }
 
-// mailparser 内置的 html→text 转换（默认配置）会丢失 contenteditable span 等大量正文，
-// 而招聘邮件的职位名常放在这些位置（js-position-name 模板等）。用 html-to-text 显式
-// 配置重新转换，保证正文完整。ignoreHref 只保留链接文本、ignoreImage 去掉图片噪音。
+// mailparser 内置的 html→text 转换（默认配置）可能丢失不可编辑节点中的可见正文。
+// 这里使用通用 HTML 转换保证正文完整；不识别任何公司或邮件模板。
 function htmlToPlainText(html) {
   if (typeof html !== 'string' || !html) return '';
   // 极端大 HTML（如内嵌 200KB 图片 base64）截断到 500KB 再转，防解析卡死
@@ -81,20 +85,15 @@ function htmlToPlainText(html) {
   return text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-// mailparser 的 html-to-text 会丢弃 contenteditable="false" span 的文本，
-// 而腾讯系/小红书系招聘邮件把职位名放在
-// <span contenteditable="false"><span id="js-position-name">视频用户产品实习生</span></span> 这类模板里，
-// 导致职位在纯文本阶段丢失、模型只能拿主题词充数。这里从 html 兜底恢复。
+// mailparser 的 html-to-text 可能丢弃 contenteditable="false" span 的文本；
+// 一些招聘系统会把正文关键信息放在这类不可编辑节点中，因此通用恢复可见文本。
 function recoverHiddenText(parsed) {
   const base = typeof parsed.text === 'string' ? parsed.text : '';
   if (typeof parsed.html !== 'string' || !parsed.html) return base;
   const recovered = [];
-  for (const match of parsed.html.matchAll(/<span[^>]*id="js-[a-z-]+"[^>]*>([^<]{1,80})<\/span>/gi)) {
-    const value = match[1].trim();
-    if (value) recovered.push(value);
-  }
-  for (const match of parsed.html.matchAll(/<span[^>]*contenteditable="false"[^>]*>\s*([^<]{1,80}?)\s*<\/span>/gi)) {
-    const value = match[1].trim();
+  const lockedElementPattern = /<([a-z][\w:-]*)\b[^>]*\bcontenteditable\s*=\s*(?:"false"|'false'|false)[^>]*>([\s\S]*?)<\/\1\s*>/gi;
+  for (const match of parsed.html.matchAll(lockedElementPattern)) {
+    const value = htmlToPlainText(match[2]).trim().slice(0, 200);
     if (value) recovered.push(value);
   }
   const additions = [...new Set(recovered)].filter((value) => !base.includes(value));
@@ -123,7 +122,7 @@ export function createImapSource({
   env = typeof process !== 'undefined' ? process.env : {},
 } = {}) {
   return {
-    async fetchMessages({ provider, email, authorizationCode, from, to, maxMessages = 100 }) {
+    async fetchMessages({ provider, email, authorizationCode, from, to, maxMessages }) {
       const profile = providerRegistry(provider);
       const user = requiredText(email, 'email');
       const pass = requiredText(authorizationCode, 'authorizationCode');
@@ -144,6 +143,10 @@ export function createImapSource({
         ...(proxy ? { proxy } : {}),
         ...(profile.tlsServername && profile.tlsServername !== profile.host ? { tls: { servername: profile.tlsServername } } : {}),
       });
+      // ImapFlow 在连接已异常关闭、调用方已经捕获 fetch 错误之后，仍可能异步再发出
+      // 一个 `error` 事件。EventEmitter 若无人监听会直接终止整个本地服务进程。
+      // 保留实例级监听器承接该尾随事件；主流程错误仍由下方 await 正常抛给 API。
+      client.on?.('error', () => {});
       let lock;
       try {
         await client.connect();
@@ -178,7 +181,7 @@ export function createImapSource({
             uid: String(item.uid),
             messageId: parsed.messageId || item.envelope?.messageId || '',
             receivedAt: new Date(date).toISOString(),
-            sender: formatSender(parsed.from),
+            sender: formatSender(parsed.from) || formatSender(item.envelope?.from),
             subject: String(parsed.subject || item.envelope?.subject || ''),
             text: clampText(text),
             html: typeof parsed.html === 'string' ? parsed.html : '',

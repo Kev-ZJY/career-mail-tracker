@@ -12,6 +12,7 @@ import { createMailboxService } from './services/mailbox-service.js';
 import { createImapSource } from './services/imap-source.js';
 import { createLlmClassifier } from './services/llm-service.js';
 import { bootstrapCredentials } from './services/credential-bootstrap.js';
+import { loadLocalRules } from './rules-config.js';
 
 const publicDirectory = resolve(fileURLToPath(new URL('../public', import.meta.url)));
 const contentTypes = {
@@ -71,12 +72,14 @@ export function createServer({ config = createConfig(), databasePath } = {}) {
     syncService,
     imapSource,
     mailboxService,
-    createClassifier: () => {
+    createClassifier: async () => {
       const model = settingsService.getActiveModel();
       if (!model.credentialRef && model.id !== 'ollama') return null;
+      const rules = await loadLocalRules(resolve(config.rulesFile || join(config.dataDir, 'rules.toml')));
       return createLlmClassifier({
         provider: model,
         credentialStore,
+        rules,
       });
     },
   });

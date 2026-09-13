@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 
 const schema = `
   PRAGMA journal_mode = WAL;
+  PRAGMA foreign_keys = ON;
 
   CREATE TABLE IF NOT EXISTS mail_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,15 +53,29 @@ const schema = `
     event_end TEXT,
     latest_received_at TEXT NOT NULL,
     latest_message_id INTEGER,
+    manual_position_override INTEGER NOT NULL DEFAULT 0,
     source TEXT NOT NULL DEFAULT 'email',
     updated_at TEXT NOT NULL
   );
 
-  -- 防重复线程：position 非空时同 (account, company, position) 只能一行。
-  -- 空 position（未识别岗位）不约束——这类线程靠回填按组取最新 + findThreadByKey 合并。
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_application_threads_unique
+  -- 进行中的同公司同岗位只保留一条；已结束后允许用户再次申请同一岗位。
+  -- 空 position（未识别岗位）不约束，由线程归属模型决定是否合并。
+  DROP INDEX IF EXISTS idx_application_threads_unique;
+  CREATE UNIQUE INDEX idx_application_threads_unique
     ON application_threads(account_id, company, position)
-    WHERE position != '';
+    WHERE position != '' AND status != '已结束';
+
+  CREATE TABLE IF NOT EXISTS application_thread_messages (
+    thread_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    linked_at TEXT NOT NULL,
+    PRIMARY KEY (thread_id, message_id),
+    FOREIGN KEY (thread_id) REFERENCES application_threads(id) ON DELETE CASCADE,
+    FOREIGN KEY (message_id) REFERENCES mail_messages(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_application_thread_messages_message
+    ON application_thread_messages(message_id);
 
   CREATE TABLE IF NOT EXISTS sync_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,6 +85,10 @@ const schema = `
     inserted_count INTEGER NOT NULL,
     analyzed_count INTEGER NOT NULL,
     skipped_count INTEGER NOT NULL,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    ignored_count INTEGER NOT NULL DEFAULT 0,
+    model_failed_count INTEGER NOT NULL DEFAULT 0,
+    failure_details TEXT NOT NULL DEFAULT '[]',
     source TEXT NOT NULL DEFAULT 'imap',
     created_at TEXT NOT NULL
   );
@@ -120,7 +139,12 @@ export function createDatabase(filePath) {
   addColumn('mail_messages', 'web_url', 'TEXT');
   addColumn('mail_messages', 'body_text', 'TEXT');
   addColumn('mail_messages', 'body_html', 'TEXT');
+  addColumn('application_threads', 'manual_position_override', 'INTEGER NOT NULL DEFAULT 0');
   addColumn('sync_runs', 'source', "TEXT NOT NULL DEFAULT 'imap'");
+  addColumn('sync_runs', 'candidate_count', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('sync_runs', 'ignored_count', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('sync_runs', 'model_failed_count', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('sync_runs', 'failure_details', "TEXT NOT NULL DEFAULT '[]'");
   // Backfill application_threads from mail_messages (run once, marked by settings)
   // Skip for :memory: databases - tests will call backfillApplicationThreads explicitly
   if (filePath !== ':memory:') {
@@ -171,6 +195,14 @@ export function runBackfillIfNeeded(db) {
     `);
     db.prepare('INSERT INTO settings(key, value) VALUES(?, ?)').run('threads.backfill.v1', 'done');
   }
+  // 老库没有显式邮件历史，只能可靠回填每条线程当前指向的最新邮件。
+  db.exec(`
+    INSERT OR IGNORE INTO application_thread_messages(thread_id, message_id, linked_at)
+    SELECT id, latest_message_id, COALESCE(updated_at, latest_received_at)
+    FROM application_threads
+    WHERE latest_message_id IS NOT NULL
+      AND EXISTS (SELECT 1 FROM mail_messages m WHERE m.id = application_threads.latest_message_id);
+  `);
 }
 
 export function createMessageRepository(db) {
@@ -252,6 +284,58 @@ export function createMessageRepository(db) {
         : null;
     },
 
+    listThreadMessages(threadId) {
+      return db.prepare(`
+        SELECT m.id, m.provider, m.received_at AS receivedAt, m.sender, m.subject,
+          m.web_url AS webUrl, m.body_text AS bodyText, m.body_html AS bodyHtml
+        FROM application_thread_messages link
+        JOIN mail_messages m ON m.id = link.message_id
+        WHERE link.thread_id = ?
+        ORDER BY m.received_at DESC, m.id DESC
+      `).all(Number(threadId));
+    },
+
+    linkMessageToThread(threadId, messageId, linkedAt = new Date().toISOString()) {
+      if (!Number.isInteger(Number(threadId)) || !Number.isInteger(Number(messageId))) return false;
+      const result = db.prepare(`
+        INSERT OR IGNORE INTO application_thread_messages(thread_id, message_id, linked_at)
+        VALUES (?, ?, ?)
+      `).run(Number(threadId), Number(messageId), linkedAt);
+      return Number(result.changes) > 0;
+    },
+
+    unlinkMessageFromThreads(messageId) {
+      const result = db.prepare(`
+        DELETE FROM application_thread_messages WHERE message_id = ?
+      `).run(Number(messageId));
+      return Number(result.changes);
+    },
+
+    findManualPositionOverrideThreadForMessage(messageId) {
+      const row = db.prepare(`
+        SELECT t.id, t.account_id AS accountId, t.company, t.position, t.status,
+          t.manual_position_override AS manualPositionOverride
+        FROM application_thread_messages link
+        JOIN application_threads t ON t.id = link.thread_id
+        WHERE link.message_id = ? AND t.manual_position_override = 1
+        ORDER BY t.updated_at DESC, t.id DESC
+        LIMIT 1
+      `).get(Number(messageId));
+      return row ? { ...row, manualPositionOverride: true } : null;
+    },
+
+    deleteOrphanEmailThreads() {
+      const result = db.prepare(`
+        DELETE FROM application_threads
+        WHERE source != 'manual'
+          AND NOT EXISTS (
+            SELECT 1 FROM application_thread_messages link
+            WHERE link.thread_id = application_threads.id
+          )
+      `).run();
+      return Number(result.changes);
+    },
+
     saveAnalysis(record, existing) {
       const values = [
         record.messageKey,
@@ -275,7 +359,7 @@ export function createMessageRepository(db) {
         record.analyzedAt,
         record.analysis.eventStart || null,
         record.analysis.eventEnd || null,
-        record.analysis.notes || record.analysis.evidence || null,
+        record.analysis.notes ?? null,
         record.webUrl || null,
         record.bodyText || null,
         record.bodyHtml || null,
@@ -303,7 +387,7 @@ export function createMessageRepository(db) {
           record.analyzedAt,
           record.analysis.eventStart || null,
           record.analysis.eventEnd || null,
-          record.analysis.notes || record.analysis.evidence || null,
+          record.analysis.notes ?? null,
           record.webUrl || null,
           // 正文是重拉成本高的原始档案：调用方未提供时保留库内旧值，避免误清
           record.bodyText ?? (existing.body_text || null),
@@ -363,7 +447,7 @@ export function createMessageRepository(db) {
         analyzedAt,
         progress.eventStart ? new Date(progress.eventStart).toISOString() : receivedAt,
         progress.eventEnd ? new Date(progress.eventEnd).toISOString() : null,
-        progress.notes || progress.evidence,
+        progress.notes ?? null,
         progress.webUrl || null,
         'manual',
       );
@@ -384,7 +468,7 @@ export function createMessageRepository(db) {
         new Date(progress.eventStart || progress.receivedAt || existing.receivedAt).toISOString(),
         progress.eventStart ? new Date(progress.eventStart).toISOString() : existing.eventStart,
         progress.eventEnd ? new Date(progress.eventEnd).toISOString() : null,
-        progress.notes || progress.evidence || existing.notes || existing.evidence,
+        progress.notes ?? existing.notes ?? null,
         progress.evidence || progress.notes || existing.evidence,
         progress.nextAction || existing.nextAction,
         progress.needsReview ? 1 : 0,
@@ -415,8 +499,9 @@ export function createMessageRepository(db) {
     recordSyncRun(run) {
       const result = db.prepare(`
         INSERT INTO sync_runs(account_id, from_date, to_date, inserted_count,
-          analyzed_count, skipped_count, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          analyzed_count, skipped_count, candidate_count, ignored_count,
+          model_failed_count, failure_details, source, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         run.accountId,
         run.from,
@@ -424,6 +509,10 @@ export function createMessageRepository(db) {
         run.inserted,
         run.analyzed,
         run.skipped,
+        run.candidates || 0,
+        run.ignored || 0,
+        run.modelFailed || 0,
+        JSON.stringify(run.failures || []),
         run.source || 'imap',
         new Date().toISOString(),
       );
@@ -435,9 +524,17 @@ export function createMessageRepository(db) {
       return db.prepare(`
         SELECT id, account_id AS accountId, from_date AS fromDate, to_date AS toDate,
           inserted_count AS inserted, analyzed_count AS analyzed, skipped_count AS skipped,
+          candidate_count AS candidates, ignored_count AS ignored,
+          model_failed_count AS modelFailed, failure_details AS failureDetails,
           source, created_at AS createdAt
         FROM sync_runs ORDER BY id DESC LIMIT ?
-      `).all(safeLimit);
+      `).all(safeLimit).map(({ failureDetails, ...run }) => {
+        try {
+          return { ...run, failures: JSON.parse(failureDetails || '[]') };
+        } catch {
+          return { ...run, failures: [] };
+        }
+      });
     },
 
     // Thread methods
@@ -445,25 +542,35 @@ export function createMessageRepository(db) {
       const clauses = ['1=1'];
       const params = [];
       if (filters.from) {
-        clauses.push('latest_received_at >= ?');
+        clauses.push('t.latest_received_at >= ?');
         params.push(filters.from);
       }
       if (filters.to) {
-        clauses.push('latest_received_at <= ?');
+        clauses.push('t.latest_received_at <= ?');
         params.push(filters.to);
       }
       if (filters.accountId) {
-        clauses.push('account_id = ?');
+        clauses.push('t.account_id = ?');
         params.push(filters.accountId);
       }
       const where = `WHERE ${clauses.join(' AND ')}`;
       const rows = db.prepare(`
-        SELECT id, account_id AS accountId, company, position, status, confidence, needs_review AS needsReview,
-          evidence, next_action AS nextAction, notes, event_start AS eventStart, event_end AS eventEnd,
-          latest_received_at AS latestReceivedAt, latest_message_id AS latestMessageId, source, updated_at AS updatedAt
-        FROM application_threads ${where} ORDER BY latest_received_at DESC
+        SELECT t.id, t.account_id AS accountId, t.company, t.position, t.status, t.confidence,
+          t.needs_review AS needsReview, t.evidence, t.next_action AS nextAction, t.notes,
+          t.event_start AS eventStart, t.event_end AS eventEnd,
+          t.latest_received_at AS latestReceivedAt, t.latest_message_id AS latestMessageId,
+          t.manual_position_override AS manualPositionOverride, t.source, t.updated_at AS updatedAt,
+          latest.sender AS latestSender
+        FROM application_threads t
+        LEFT JOIN mail_messages latest ON latest.id = t.latest_message_id
+        ${where} ORDER BY t.latest_received_at DESC
       `).all(...params);
-      return rows.map(r => ({ ...r, needsReview: Boolean(r.needsReview) }));
+      return rows.map(({ latestSender, ...r }) => ({
+        ...r,
+        ...(filters.routingSignals ? { latestSender: latestSender || '' } : {}),
+        needsReview: Boolean(r.needsReview),
+        manualPositionOverride: Boolean(r.manualPositionOverride),
+      }));
     },
 
     getCountsByThreads(filters = {}) {
@@ -492,17 +599,18 @@ export function createMessageRepository(db) {
       const row = db.prepare(`
         SELECT id FROM application_threads
         WHERE account_id = ? AND TRIM(LOWER(company)) = TRIM(LOWER(?)) AND TRIM(LOWER(position)) = TRIM(LOWER(?))
+        ORDER BY CASE WHEN status = '已结束' THEN 1 ELSE 0 END, latest_received_at DESC, id DESC
         LIMIT 1
       `).get(accountId, company, position);
       return row ? row.id : null;
     },
 
     upsertThreadFromMessage({ threadId, accountId, company, position, status, confidence, needsReview,
-      evidence, nextAction, notes, eventStart, eventEnd, receivedAt, messageId }) {
+      evidence, nextAction, notes, eventStart, eventEnd, receivedAt, messageId, forceNew = false }) {
       const updatedAt = new Date().toISOString();
       let targetThreadId = threadId;
 
-      if (!targetThreadId) {
+      if (!targetThreadId && !forceNew) {
         targetThreadId = this.findThreadByKey(accountId, company, position || '');
         // 已结束线程不可被非终态邮件复活：resolver 判定归属失败后，
         // 按 (公司,岗位) 命中的已结束线程不能复用，必须另起一行交人工复核。
@@ -515,12 +623,17 @@ export function createMessageRepository(db) {
 
       if (targetThreadId) {
         // Check if we should update (new message is newer or equal)
-        const existing = db.prepare('SELECT latest_received_at, position FROM application_threads WHERE id = ?').get(targetThreadId);
+        const existing = db.prepare(`
+          SELECT latest_received_at, position, manual_position_override
+          FROM application_threads WHERE id = ?
+        `).get(targetThreadId);
         if (existing && existing.latest_received_at > receivedAt) {
           return targetThreadId; // Don't update, existing is newer
         }
         // 无岗位的后续邮件（反馈问卷/流程通知）不得清空线程已确认的岗位
-        const resolvedPosition = position || existing?.position || '';
+        const resolvedPosition = existing?.manual_position_override
+          ? existing.position
+          : (position || existing?.position || '');
         db.prepare(`
           UPDATE application_threads SET
             company = ?, position = ?, status = ?, confidence = ?, needs_review = ?,
@@ -529,7 +642,7 @@ export function createMessageRepository(db) {
           WHERE id = ?
         `).run(
           company, resolvedPosition, status, confidence, needsReview ? 1 : 0,
-          evidence || '', nextAction || '', notes || null,
+          evidence || '', nextAction || '', notes ?? null,
           eventStart || null, eventEnd || null,
           receivedAt, messageId || null, updatedAt, targetThreadId
         );
@@ -544,7 +657,7 @@ export function createMessageRepository(db) {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'email', ?)
           `).run(
             accountId, company, position || '', status, confidence, needsReview ? 1 : 0,
-            evidence || '', nextAction || '', notes || null,
+            evidence || '', nextAction || '', notes ?? null,
             eventStart || null, eventEnd || null,
             receivedAt, messageId || null, updatedAt
           );
@@ -559,7 +672,7 @@ export function createMessageRepository(db) {
             WHERE id = ?
           `).run(
             company, position || '', status, confidence, needsReview ? 1 : 0,
-            evidence || '', nextAction || '', notes || null,
+            evidence || '', nextAction || '', notes ?? null,
             eventStart || null, eventEnd || null,
             receivedAt, messageId || null, updatedAt, fallbackId
           );
@@ -581,7 +694,7 @@ export function createMessageRepository(db) {
           latest_received_at = ?, latest_message_id = ?, updated_at = ?
         WHERE id = ?
       `).run(
-        status, eventStart || null, eventEnd || null, notes || null,
+        status, eventStart || null, eventEnd || null, notes ?? null,
         receivedAt, messageId || null, updatedAt, threadId
       );
       return true;
@@ -591,14 +704,19 @@ export function createMessageRepository(db) {
       const row = db.prepare(`
         SELECT id, account_id AS accountId, company, position, status, confidence, needs_review AS needsReview,
           evidence, next_action AS nextAction, notes, event_start AS eventStart, event_end AS eventEnd,
-          latest_received_at AS latestReceivedAt, latest_message_id AS latestMessageId, source, updated_at AS updatedAt
+          latest_received_at AS latestReceivedAt, latest_message_id AS latestMessageId,
+          manual_position_override AS manualPositionOverride, source, updated_at AS updatedAt
         FROM application_threads WHERE id = ?
       `).get(Number(id));
-      return row ? { ...row, needsReview: Boolean(row.needsReview) } : null;
+      return row ? {
+        ...row,
+        needsReview: Boolean(row.needsReview),
+        manualPositionOverride: Boolean(row.manualPositionOverride),
+      } : null;
     },
 
     updateThread(id, patch) {
-      const allowed = ['company', 'position', 'status', 'confidence', 'needsReview', 'evidence', 'nextAction', 'notes', 'eventStart', 'eventEnd', 'source'];
+      const allowed = ['company', 'position', 'status', 'confidence', 'needsReview', 'evidence', 'nextAction', 'notes', 'eventStart', 'eventEnd', 'manualPositionOverride', 'source'];
       const sets = [];
       const params = [];
       for (const [k, v] of Object.entries(patch)) {
@@ -630,7 +748,7 @@ export function createMessageRepository(db) {
       `).run(
         'manual', progress.company, progress.position, progress.status,
         progress.confidence ?? 1, 0,
-        progress.evidence, progress.nextAction, progress.notes || null,
+        progress.evidence, progress.nextAction, progress.notes ?? null,
         progress.eventStart ? new Date(progress.eventStart).toISOString() : null,
         progress.eventEnd ? new Date(progress.eventEnd).toISOString() : null,
         new Date(progress.receivedAt || progress.eventStart).toISOString(),

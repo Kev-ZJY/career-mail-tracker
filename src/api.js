@@ -2,6 +2,7 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const ALLOWED_PROGRESS_STATUSES = new Set(['已投递', '测评中', '面试', 'Offer', '已结束']);
 const DATE_ONLY_OFFSET = '+08:00';
 import { ApiError } from './errors.js';
+import { buildProgressNotes } from './domain/progress-notes.js';
 
 function sendJson(response, status, payload) {
   const body = JSON.stringify(payload);
@@ -200,7 +201,13 @@ export function createApi({
           dryRun,
         });
         if (!dryRun) {
-          repository.saveSetting(`sync.watermark.${accountId}`, to);
+          const retryTimes = (summary.failures || [])
+            .map((failure) => Date.parse(failure.receivedAt))
+            .filter(Number.isFinite);
+          const watermark = retryTimes.length > 0
+            ? new Date(Math.min(...retryTimes) - 1).toISOString()
+            : to;
+          repository.saveSetting(`sync.watermark.${accountId}`, watermark);
         }
         sendJson(response, 200, { ...summary, mode: source, accountId, from, to, dryRun, maxMessages: maxMessages ?? null });
         return;
@@ -211,10 +218,10 @@ export function createApi({
         const company = typeof input.company === 'string' ? input.company.trim() : '';
         const position = typeof input.position === 'string' ? input.position.trim() : '';
         const evidence = typeof input.evidence === 'string' ? input.evidence.trim() : '';
-        const notes = typeof input.notes === 'string' ? input.notes.trim() : evidence;
+        const rawNotes = typeof input.notes === 'string' ? input.notes.trim() : evidence;
         const nextAction = typeof input.nextAction === 'string' ? input.nextAction.trim() : '由用户手动维护';
-        if (!company || !position || !notes) {
-          throw new Error('company, position, and notes are required');
+        if (!company || !position) {
+          throw new Error('company and position are required');
         }
         if (!ALLOWED_PROGRESS_STATUSES.has(input.status)) throw new Error('status is invalid');
         const receivedAt = input.receivedAt || input.eventStart || new Date().toISOString();
@@ -222,6 +229,11 @@ export function createApi({
         if (input.eventEnd && (!Number.isFinite(Date.parse(input.eventEnd)) || Date.parse(input.eventEnd) < Date.parse(receivedAt))) {
           throw new Error('eventEnd is invalid');
         }
+        const notes = buildProgressNotes({
+          status: input.status,
+          notes: rawNotes,
+          eventEnd: input.eventEnd,
+        });
         const row = repository.addManualThread({
           company,
           position,
@@ -250,27 +262,46 @@ export function createApi({
         return;
       }
 
+      const emailHistoryMatch = path.match(/^\/api\/progress\/(\d+)\/emails$/);
+      if (request.method === 'GET' && emailHistoryMatch) {
+        const messages = repository.listThreadMessages?.(Number(emailHistoryMatch[1])) || [];
+        if (!messages.length) {
+          sendJson(response, 404, { error: 'email history unavailable' });
+          return;
+        }
+        sendJson(response, 200, { threadId: Number(emailHistoryMatch[1]), messages });
+        return;
+      }
+
       const editMatch = path.match(/^\/api\/progress\/(\d+)$/);
       if (request.method === 'PUT' && editMatch) {
         const input = await readJson(request);
+        const threadId = Number(editMatch[1]);
+        const existingThread = repository.getThread(threadId);
+        if (!existingThread) { sendJson(response, 404, { error: 'progress not found' }); return; }
         const company = typeof input.company === 'string' ? input.company.trim() : '';
         const position = typeof input.position === 'string' ? input.position.trim() : '';
         const eventStart = input.eventStart || input.receivedAt;
         if (!company || !ALLOWED_PROGRESS_STATUSES.has(input.status)) throw new Error('company and status are required');
         if (!eventStart || !Number.isFinite(Date.parse(eventStart))) throw new Error('eventStart is invalid');
         if (input.eventEnd && (!Number.isFinite(Date.parse(input.eventEnd)) || Date.parse(input.eventEnd) < Date.parse(eventStart))) throw new Error('eventEnd is invalid');
-        const row = repository.updateThread(Number(editMatch[1]), {
+        const patch = {
           company,
           position,
           status: input.status,
           eventStart: new Date(eventStart).toISOString(),
           eventEnd: input.eventEnd ? new Date(input.eventEnd).toISOString() : null,
-          notes: typeof input.notes === 'string' ? input.notes.trim() : '',
-          evidence: typeof input.evidence === 'string' ? input.evidence.trim() : '',
-          nextAction: typeof input.nextAction === 'string' ? input.nextAction.trim() : '',
+          notes: buildProgressNotes({
+            status: input.status,
+            notes: typeof input.notes === 'string' ? input.notes.trim() : '',
+            eventEnd: input.eventEnd,
+          }),
           needsReview: false,
-        });
-        if (!row) { sendJson(response, 404, { error: 'progress not found' }); return; }
+          manualPositionOverride: existingThread.manualPositionOverride || position !== existingThread.position,
+        };
+        if (typeof input.evidence === 'string') patch.evidence = input.evidence.trim();
+        if (typeof input.nextAction === 'string') patch.nextAction = input.nextAction.trim();
+        const row = repository.updateThread(threadId, patch);
         sendJson(response, 200, row);
         return;
       }

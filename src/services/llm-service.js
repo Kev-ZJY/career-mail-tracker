@@ -1,3 +1,7 @@
+import { buildProgressNotes } from '../domain/progress-notes.js';
+import { resolveCompanyName } from '../domain/company-resolver.js';
+import { senderIdentityKey } from '../domain/sender-identity.js';
+
 const STATUS = {
   submitted: '已投递',
   assessment: '测评中',
@@ -18,6 +22,8 @@ export const EXTRACTION_PROMPT = `你是“本地求职进度追踪器”的招�
 【第一道判断：是否属于个人招聘进度】
 isJobRelated=true 仅适用于用户本人已经投递、申请、进入测评、收到面试安排、收到录用结果，或收到该申请流程结束/未通过通知的邮件。
 以下邮件不属于个人招聘进度，必须返回 isJobRelated=false，不能创建或更新某个公司的招聘进度：招聘活动、宣讲会、招聘会、双选会、招聘峰会、招聘活动预告；招聘网站的岗位推荐、职位订阅、职位提醒、热招岗位推送；批量营销、开放投递广告、求职/申请攻略、培训/课程推广、泛化的校园招聘资讯。邮件里出现“招聘”“岗位”“投递”等词，不代表它就是用户本人申请进度。
+“火热招聘中”“诚邀加入/申请”“立即投递”“申请截止日期”“面向应届生”等是在邀请收件人未来申请，不代表收件人已经完成申请；营销邮件用“你/您/同学”称呼收件人也不是个人进度证据。只有完成时或已发生的个人动作/结果（例如“已收到你的申请”“你已通过简历评估”）才能据此判为 true。
+判断顺序必须是：先在全文查找“已收到你的申请/简历”“感谢申请/投递”“邀请你完成测评/参加面试”“申请未通过”等指向用户本人的完成时进度证据；只要存在这类证据，isJobRelated 就是 true。只有全文都没有个人进度证据时，才根据活动、宣讲、推广或岗位推荐判断 false。招聘邮件在个人申请确认之后附带宣讲会、抽奖、二维码或品牌宣传很常见，这些尾部内容不得把前面的个人申请进度覆盖成 false。
 当 isJobRelated=false 时，status 仍必须填写“已结束”（这是为了满足统一字段枚举；该记录会被系统隐藏，不应显示在招聘进度列表中），needsReview=false，nextAction 写“不写入招聘进度列表”。
 
 【status 只能使用以下五个值】
@@ -26,13 +32,13 @@ isJobRelated=true 仅适用于用户本人已经投递、申请、进入测评�
 3. 面试：明确邀请、安排、预约或确认用户参加面试/面谈/技术面/电话面。
 4. Offer：明确表示录用、发放 Offer、正式聘用、薪资方案或入职意向；不能把“Offer 机会”“Offer 攻略”“欢迎投递”等广告当作 Offer。
 5. 已结束：明确拒绝、未通过、暂不推进、不再推进、遗憾通知、岗位/流程关闭、申请结束，或邀请填写面试/招聘反馈问卷的邮件。拒绝不是单独的状态，统一归为已结束。
-绝对不要输出“待确认”“拒绝”“筛选中”这三个状态。如果邮件属于个人流程但证据不足，仍使用最符合证据的五个状态，并将 needsReview=true、confidence 调低，在 notes 中写明缺少什么；如果完全无法确认是个人流程，则按上面的 isJobRelated=false 处理。
+绝对不要输出“待确认”“拒绝”“筛选中”这三个状态。如果邮件属于个人流程但证据不足，仍使用最符合证据的五个状态，并将 needsReview=true、confidence 调低；不要把缺失项或低置信度原因写进 notes。如果完全无法确认是个人流程，则按上面的 isJobRelated=false 处理。
 
 【冲突判断优先级】
 已结束 > 测评中 > Offer > 面试 > 已投递。优先使用明确的终态/事件信号。例如“面试反馈问卷 + 流程已结束”必须是已结束；“测评 + 后续 Offer 流程”必须是测评中；“岗位推荐 + 投递入口”仍是非个人进度。
 
 【时间与日期规则】
-输入会提供邮件接收时间 receivedAt，并注明北京时间。邮件只写月/日而没有年份时，使用 receivedAt 对应的北京时间年份，绝不要擅自使用 2025 或其他年份。只在邮件明确给出时间时填写 eventStart/eventEnd；没有明确面试时间就不要编造时间，并在 notes 写“未提供明确面试时间”。测评邮件只有截止时间时，eventStart=receivedAt，eventEnd=测评截止时间；如果截止时间只有月/日，也按 receivedAt 的北京时间年份解析。时间必须是可解析的 ISO 8601 字符串，保留精确到分钟的信息。
+输入会提供邮件接收时间 receivedAt，并注明北京时间。邮件只写月/日而没有年份时，使用 receivedAt 对应的北京时间年份，绝不要擅自使用 2025 或其他年份。只在邮件明确给出时间时填写 eventStart/eventEnd；没有明确面试时间就不要编造时间。测评邮件只有截止时间时，eventStart=receivedAt，eventEnd=测评截止时间；如果截止时间只有月/日，也按 receivedAt 的北京时间年份解析。时间必须是可解析的 ISO 8601 字符串，保留精确到分钟的信息。
 
 【字段契约】
 必须返回以下字段：
@@ -45,40 +51,55 @@ isJobRelated=true 仅适用于用户本人已经投递、申请、进入测评�
   "evidence": string,
   "nextAction": string,
   "needsReview": boolean,
-  "threadRef": number | "new"（见【申请线程归属】；无把握时填 "new"）,
-  "appliesTo": number[]（仅测评覆盖多岗位时填写，否则省略）,
+  "threadRef": "new"（历史申请由系统在本地归并，不要猜测编号）,
+  "appliesToAll": boolean（仅测评邮件明确覆盖本人已投递的全部岗位时为 true，否则 false；不需要知道历史线程）,
   "eventStart": string（有明确时间时填写，否则省略）, 
   "eventEnd": string（有明确结束/截止时间时填写，否则省略）, 
   "notes": string（可选，见精简要求）
 }
 
+【company 抽取与统一｜必须遵守】
+1. 综合发件人显示名、主题、正文中的申请对象与落款提取本次实际用人/招聘主体。发件人显示名是明确的公司或招聘品牌时属于强证据；除非正文明确说明用户申请的是另一用人单位，否则不要被岗位、项目或计划名中看似公司的词覆盖。
+2. 不把邮件服务商、ATS/招聘平台、部门、项目团队、招聘计划、岗位名或发件邮箱域名直接当成公司。上级集团与本次明确招聘的子公司、研究院、研究所或事业单位同时出现时，优先最具体的用人单位。
+3. 公司同时出现中文名和英文名时，company 必须优先输出最明确的中文名称；只有邮件全文确实没有中文名称时才输出英文名称。即使发件人显示名是英文品牌，只要主题、正文申请对象或落款明确给出同一主体的中文名，也必须返回中文名，不能因为发件人排在最前面就保留英文名。
+4. 只根据本封邮件判断招聘主体。集团母公司、旗下独立子公司、不同事业品牌不能仅因共享集团字样就算同一主体；公司名称的历史统一由系统在本地完成。
+5. 邮件无法确认公司时 company 返回空字符串，不从岗位或历史记录猜造。
+
+公司边界：发件人显示名是招聘主体，而正文仅在项目或计划名中出现另一个组织词时，不要仅凭该词改写 company；集团与明确负责本次招聘的下属单位同时出现时，选择下属单位；同一主体同时有中文与英文名称时，优先输出邮件中的中文名称。
+
 【position 抽取规则｜必须遵守】
-position 必须是在邮件原文中明确出现的“岗位/职位名称”（例如：商业化产品运营实习生、产品运营、后端开发工程师）。常见来源：
-- 主题中的职位模式：如「简历投递成功 - <候选人> - <职位名>」「面试邀请 — <职位名>」「<职位名> 一面通知」「反馈通知：<公司>-<职位名>」等，取分隔符后紧跟的职位本体；
-- 正文中的职位段落：如「应聘岗位：<职位名>」「职位：<职位名>」「岗位：<职位名>」「面试岗位：<职位名>」「面试岗位：【<职位名>】」「你暂不匹配<职位名>岗位的需求」等；
-- 英文邮件中的职位锚点：如 "for the role of <position>"、"position of <position>"、"your application for <position>"、"applying for the <position>"、"Interview for <position>" 等，英文职位名（如 "(Chinese Mainland) Internship Recruiting - Research & Development Summer Intern"）是有效职位，不得因语种忽略；subject 中的英文职位（如 "GE Aerospace Job Application Update: <申请号> <职位名>"）取申请号之后的职位部分。
-提取要求：
-1. 届次/批次信息是职位名的组成部分，必须原样保留：如「2027届暑期实习-产品运营助理」「【转正实习】产品经理岗」「产品经理（2027届实习）- 北京」都应整体作为 position 输出，不得剥离届次。只去掉公司名或渠道名前缀（如“小红书-”“实习僧”），不得去掉届次。当职位以「部门-岗位」形式出现时（如「国际事业群IBG（1）-用户与策略产品实习生」），优先把岗位名放前面，做不到不强求。
-2. 剥离紧贴职位名的时间戳：如「2026-01-20 15:00:00视频用户产品实习生」→ 输出「视频用户产品实习生」；「3月12日 14:30产品运营」→ 输出「产品运营」。日期时间属于面试信息，不属于职位名。
-3. 剥离批次前缀：position 前缀若是「<N年|N届>…实习生/校招/校园招聘-」这类批次声明且其后还有岗位名，只取岗位本体：如「2027实习生校园招聘-【留用实习】数据分析师-风控治理方向」→ 输出「【留用实习】数据分析师-风控治理方向」。
-4. 否定式/反馈句式中的职位名同样有效，必须抽取：如「你暂不匹配C端AI产品经理实习生（Prompt Engineer 方向）岗位的需求」「很遗憾你未通过<职位名>的筛选」「感谢您应聘<职位名>岗位」中的<职位名>都是明确职位，不能因为句子是否定式就当成没有职位。这类「不匹配某岗位」「未通过筛选」的反馈邮件属于用户本人申请流程的反馈（isJobRelated=true、status=已结束），不能误判为招聘活动或岗位推荐。
-5. 严禁把流程词、环节词、面试形式词或邮件主题词填进 position。以下均不是职位：面试邀请、测评邀请、视频面试、能力测评、业务面试、在线测评、面试安排、面试体验、现场访客码、访客码、面试、测评、笔试、群面、单面、一面、二面、终面、通知、反馈、应聘反馈、简历投递成功、投递成功、未提及、问卷、满意度问卷、一面通知、面试通知、测评通知、投递邀请、面试邀约、面试预约、面试确认、线上面试、现场面试、电话面试、技术面试。
-6. 项目/招聘计划名不是岗位名：如「2026欧莱雅（中国）暑期实习生」「滴滴秋储实习生」「2027届暑期实习」「27届校招」都只是批次/项目名，没有具体岗位 → position 必须返回空字符串 ""。
-7. 邮件中没有明确职位名（常见于只有面试链接、访客码指引、测评入口、投递成功页链接的邮件）→ position 必须返回空字符串 ""，禁止写“未提及”等占位词，禁止推测或补全。
-8. 正文可能因长度限制被截断（只保留前 24000 字符），而职位常出现在正文中后段。若正文被截断，允许依据主题、发件人和可见片段中的职位线索谨慎推断职位名；若实在没有线索，position 返回空字符串 ""。
+position 是用户这次申请的具体岗位名称。你需要完整阅读主题和正文后进行语义提取，而不是依赖固定模板或只看某一行。
+先在内部列出所有看起来像角色名称的片段，再区分它们与用户申请的关系：只有被“申请、应聘、投递、收到申请、面试岗位”等语义直接指向的片段才是岗位；位于试卷、测评、考试、活动或项目名称中的片段不是岗位。不要输出这份内部列表。
+1. 最高优先级检查“收到您对 <职位名> 的申请”“申请/应聘/投递 <职位名>”“职位/岗位名称：<职位名>”等能把用户申请动作与具体角色直接连接起来的语义。“职位/岗位名称”字段后的值必须完整读取到该字段结束，括号、破折号或斜线中的业务方向不得删除。岗位可能位于主题、申请确认段、面试/测评说明、拒绝说明、中英文句子或较长段落中；否定句中的岗位仍是有效岗位，例如“未通过 <职位名> 的筛选”。邮件后半段即使附带宣讲、活动或营销内容，也不能覆盖前文已经明确的个人申请岗位。
+2. 邮件明确出现具体岗位时，position 不得返回空字符串。输出岗位本体即可；允许省略公司名、部门冗余、城市、届次、招聘年份、校招批次和重复的“岗位/职位”后缀，也要剔除紧贴在岗位前后的日期时间、候选人姓名和申请编号。不要因为不能逐字照抄整段长名称而放弃岗位；必须保留能区分岗位的核心名称与方向。
+3. 英文岗位同样必须提取并保留必要方向，不得因为岗位较长或邮件为英文而留空。
+4. 纯招聘批次、校园招聘项目、活动名、测评名称、试卷名称、考试科目、流程阶段和面试形式不是具体岗位。特别注意：角色词若只出现在试卷、测评或考试名称中，它仍然只是流程标签，position 必须为 ""。正文只说“意向岗位或调剂岗位涉及笔试”也没有给出具体岗位。若项目或计划名称本身包含具体职业角色，且邮件明确表示用户已参与该角色的个人申请流程，仍应提取这个角色；没有具体职业角色的项目名才留空。
+5. 严禁把面试邀请、测评邀请、视频面试、能力测评、业务面试、在线测评、面试安排、访客码、面试、测评、笔试、群面、一面、二面、终面、通知、反馈、投递成功、未提及、问卷等流程词填入 position。
+6. 只有邮件原文确实没有具体岗位时，position 才返回空字符串 ""。此时禁止根据公司或常识补全。
+7. 正文最多提供前 24000 字符。若可见内容已出现岗位就必须提取；若全部可见内容都没有具体岗位，则返回空字符串，不以 needsReview 代替岗位提取。
+8. 非空 position 必须通过必要条件：邮件中存在一句话或一个字段，明确表达“用户申请/应聘/投递/面试的是这个角色”。邀请参加考试只能证明流程状态，不能证明试卷标题里的角色就是申请岗位；试卷名称、测评名称、考试名称永远不能满足这个必要条件。
+9. 返回 JSON 前必须在内部做双向复核：如果准备返回空 position，重新查找用户申请动作是否直接带出具体角色；如果准备返回非空 position，逐字回答“邮件哪句话明确说用户申请的是这个角色”。若答案只能引用试卷/测评/考试/项目/活动名称，必须把 position 改成 ""。不要输出复核过程，也不要增加字段。
 
 【申请线程归属】
-用户消息里会附带“该公司已有的申请线程清单”，形如 #<id> <公司> <岗位>（状态：<状态>）。
-1. threadRef：填清单中的数字 id 表示这封邮件属于该既有线程；填字符串 "new" 表示这是一个新申请。只能引用清单里的 id，不得凭印象编造 id。允许岗位漂移：投递岗位 A、邮件明确写着岗位 B 的面试且 B 不在清单中时，可填 "new" 并把 position 抄成邮件原文的 B。
-2. appliesTo：当一封测评/笔试邮件覆盖同一家公司的多个已投递岗位（正文出现多个岗位名，或写明“全部申请岗位”“各岗位”）时，列出受影响的所有线程 id。
-3. 邮件没有注明岗位名称时（常见于面试邀请、流程通知），position 必须返回空字符串 ""，绝对禁止根据公司名或上下文推测、补全岗位名称；此时优先用公司级线索通过 threadRef 归入既有线程。
+本次输入不包含历史申请线程。threadRef 固定返回 "new"，不要输出不存在的线程编号，也不要输出 appliesTo。若测评邮件明确写“全部申请岗位”“所有已投递岗位”等覆盖范围，则 appliesToAll=true；仅提到一个岗位或无法确认覆盖范围时为 false。系统会在本地根据公司、岗位和进度归并申请；这不影响你在同一次请求中完整提取本封邮件的公司、岗位、状态和时间。
 
 【精简要求｜防冗余】
 - evidence 只写 1 句、最长 80 字，必须逐字引用邮件中的关键短语，不要复述整段或重复 notes。
-- notes 只有在确实有“可点击链接、截止时间缺失、低置信度原因”时才填写；无实质信息时返回空字符串 ""，不要用“无”“暂无”占位。
-- notes 中禁止重复 evidence 的原句；如有多个链接用“；”分隔，单个链接直接写 URL；总长度不超过 120 字。
+- notes 不是分析解释栏：已投递、Offer、已结束的 notes 必须返回空字符串 ""。
+- 测评中的 notes 最多只写一个可点击的测评/笔试链接；测评截止时间写入 eventEnd，由系统统一展示。
+- 面试的 notes 最多只写一个可点击的面试/会议链接。
+- 备注禁止出现邮件原文摘录、“岗位未识别/待确认”、时间缺失、低置信度原因或 evidence 的重复内容；没有上述允许链接时返回空字符串 ""。
 - nextAction 用动词开头、15 字以内（如“完成测评”“确认面试时间”）。
-- 不要把泛化广告中的公司/职业硬写成个人进度。`;
+- 不要把泛化广告中的公司/职业硬写成个人进度。
+
+【输出前最后检查｜优先级最高】
+- 先忽略纯试卷名称、纯测评名称、纯考试名称、招聘活动名和不含职业角色的项目名，再判断邮件是否仍明确写出了用户申请的具体岗位。不要机械忽略“申请/应聘/投递”的直接宾语：如果该宾语包含明确职业角色，它就是岗位候选，即使名称里还含品牌、计划、项目或括号说明。
+- 如果忽略这些名称后没有具体岗位，position 必须是 ""；“意向岗位/调剂岗位”只是泛称，不是具体岗位。
+- 如果忽略这些名称后仍有“申请/应聘/投递 <具体岗位>”“收到对 <具体岗位> 的申请”等直接关系，必须提取该岗位，不能留空。
+- “我们已收到您对 <具体岗位> 的申请”必须提取该岗位的完整角色与方向；不得仅因名称像人才计划或带括号说明而置空。
+- 边界示例：“您投递的意向岗位如涉及笔试，请完成考试。试卷名称：<招聘批次>-<角色词>试卷-<日期>。”应输出 position=""，因为角色词只属于试卷名称。
+- 正向示例：“我们已收到您对 <具体岗位> 的申请。下方是宣讲会和抽奖信息。”应输出 position="<具体岗位>"，因为申请动作直接连接具体岗位，后续宣传不能覆盖它。
+- 本检查覆盖前文中任何可能产生歧义的说明。`;
 
 function cleanBaseUrl(value) {
   if (typeof value !== 'string' || value.trim() === '') throw new Error('model baseUrl is required');
@@ -108,14 +129,8 @@ function receivedAtContext(value) {
   return `${value}；北京时间：${beijing}`;
 }
 
-function threadListContext(threads) {
-  if (!Array.isArray(threads) || threads.length === 0) return '';
-  // 上限 50 条：只当作归属线索，避免长清单把上下文撑爆
-  const lines = threads
-    .slice(0, 50)
-    .map((thread) => `#${thread?.id} ${thread?.company || '未知公司'} ${thread?.position || '岗位未知'}（状态：${thread?.status || '未知'}）`)
-    .join('\n');
-  return `【当前已有的申请线程】\n${lines}\n\n请判断这封邮件属于哪个线程，在 threadRef 填该线程的数字 id，或填 "new" 表示新申请。\n\n`;
+function mailContext(input, suffix = '') {
+  return `邮件接收时间 receivedAt：${receivedAtContext(input.receivedAt)}\n发件人：${String(input.sender || '').slice(0, 1_000)}\n主题：${String(input.subject || '').slice(0, 2_000)}\n正文：${String(input.text || '').slice(0, MAX_TEXT)}${suffix}`;
 }
 
 function hasExplicitEventTime({ subject = '', text = '' } = {}) {
@@ -123,71 +138,30 @@ function hasExplicitEventTime({ subject = '', text = '' } = {}) {
   return /(?:\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b|\b\d{1,2}年\d{1,2}月\d{1,2}[日号]?\b|\b\d{1,2}月\d{1,2}[日号]?\b|\b(?:上午|下午|晚上|凌晨)\s*(?:[01]?\d|2[0-3])(?:[:：][0-5]\d|点(?:[0-5]?\d分?)?)|\b(?:[01]?\d|2[0-3])[:：][0-5]\d\b)/i.test(combined);
 }
 
-// 职位流程词黑名单：这些是邮件主题/流程/环节/面试形式词，不是岗位名称，绝不能写进 position
+// 这里只拦截完全等于通用占位词的输出；岗位语义正确性由模型完成。
 const POSITION_BLACKLIST = new Set([
   '面试邀请', '测评邀请', '现场访客码', '面试', '测评', '未提及', '通知', '应聘反馈',
   '简历投递成功', '面试反馈', '访客码', '简历投递', '投递成功', '反馈', '问卷', '招聘',
+  '职位', '职位名称', '岗位', '岗位名称',
   '一面通知', '面试通知', '测评通知', '投递邀请', '简历更新邀请', '应聘反馈通知', '满意度问卷',
   '视频面试', '能力测评', '业务面试', '在线测评', '面试安排', '面试体验', '面试邀约',
   '线上面试', '现场面试', '电话面试', '技术面试', '群面', '单面', '一面', '二面', '终面',
   '笔试', '面试确认', '面试预约', '面试结果', '流程通知', '简历筛选', '投递反馈', '面试',
   '测评', '群面通知', '面试反馈', '招聘反馈', '人才测评', '笔试邀请', '综合能力测试',
-  '校招AI编程考察', 'AI编程考察', '编程考察', '能力测试', '综合测评', '通用能力测评',
+  'AI编程考察', '编程考察', '能力测试', '综合测评', '通用能力测评',
 ]);
 
-// 包含上述流程词的变体（如“腾讯现场访客码”“携程能力测评”“去哪儿视频面试”），也一律拒绝
-const POSITION_FLOW_WORD_RE = /(面试邀请|测评邀请|视频面试|能力测评|业务面试|在线测评|面试安排|面试体验|面试邀约|线上面试|现场面试|电话面试|技术面试|群面|单面|一面|二面|终面|笔试|访客码|未提及|投递成功|应聘反馈|满意度问卷|一面通知|面试通知|测评通知|简历评估|人才测评|面试结果|综合能力测试|AI编程考察|编程考察|能力测试|综合测评|通用能力测评)/;
-
-// 紧贴职位名前的时间戳（如「2026-01-20 15:00:00视频用户产品实习生」「3月12日 14:30产品运营」），不属于职位名
-const LEADING_TIMESTAMP_RE = /^(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?|\d{1,2}月\d{1,2}[日号]?\s*\d{1,2}[:：]\d{2}(?::\d{2})?)[\s-]*/;
-
-// 【】内只有「实习/校招/社招」等通用批次词时无含义，可剥离；含转正/留用/暑期/秋招等限定词时保留
-const GENERIC_BRACKET_PREFIX_RE = /^【(?:实习|校招|社招|招聘|内推|应届|校园)】/;
-
-// 批次前缀：「<N年|N届>…实习生/校招/校园招聘-」且其后还有岗位名时剥离（如「2027实习生校园招聘-【留用实习】数据分析师-风控治理方向」）
-const BATCH_PREFIX_RE = /^(?:20\d{2}届?|2\d届|20\d{2}|[一二三四五六七八九十]+届)[\s-]*[^\-—-]*?(?:实习生|校招|校园招聘)\s*[-—-]\s*/;
-
-// 具体岗位/角色词：剥离批次前缀后若不含这些词，说明只是项目/批次名，不是职位
-const POSITION_ROLE_WORD_RE = /(产品|运营|开发|工程师|算法|数据(?:分析|挖掘)?|设计|测试|前端|后端|客户端|iOS|Android|销售|市场|品牌|人力|HR|财务|战略|顾问|助理|专员|经理|架构|安全|运维|质量|研发|增长|用户|策略|内容|游戏|硬件|嵌入式|机器学习|Prompt|人工智能|AI)/;
-
-// 职位名规范化：剥离紧贴的时间戳、无含义的【】通用词前缀、批次前缀；届次/限定词原样保留
 function normalizePosition(value) {
-  const pos = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
-  if (!pos) return '';
-  let cleaned = pos
-    .replace(LEADING_TIMESTAMP_RE, '')
-    .replace(GENERIC_BRACKET_PREFIX_RE, '')
-    .trim();
-  const stripped = cleaned.replace(BATCH_PREFIX_RE, '');
-  if (stripped.trim()) cleaned = stripped.trim();
-  return cleaned;
-}
-
-// 批次/项目名独体：position 只剩“N年/N届+实习生/校招/项目”等批次声明、没有具体岗位词时拒绝。
-// 例如「2027届暑期实习」「秋储实习生」「2026欧莱雅（中国）暑期实习生」→ 拒绝；
-// 「2027届暑期实习-产品运营助理」「【留用实习】数据分析师-风控治理方向」→ 保留。
-function isBatchOnlyPosition(value) {
-  const pos = String(value || '').trim();
-  if (!pos) return false;
-  const stripped = pos
-    .replace(LEADING_TIMESTAMP_RE, '')
-    .replace(/^【[^】]*】/, '')                       // 去【】包装
-    .replace(/^(?:20\d{2}届?|2\d届|20\d{2}|[一二三四五六七八九十]+届)\s*/, '')  // 去届次前缀
-    .replace(BATCH_PREFIX_RE, '')                     // 去批次前缀
-    .trim();
-  if (!stripped) return true;
-  return !POSITION_ROLE_WORD_RE.test(stripped);
+  return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').slice(0, 300) : '';
 }
 
 function isProcessWordPosition(value) {
   const pos = String(value || '').trim();
   if (!pos) return false;
-  if (POSITION_BLACKLIST.has(pos)) return true;
-  if (POSITION_FLOW_WORD_RE.test(pos)) return true;
-  return isBatchOnlyPosition(pos);
+  return POSITION_BLACKLIST.has(pos);
 }
 
-function validateOutput(value, input = {}) {
+function validateOutput(value, input = {}, rules = {}) {
   if (!value || typeof value !== 'object') throw new Error('model output is invalid');
   if (!STATUS_VALUES.has(value.status)) throw new Error('model status is invalid');
   if (typeof value.isJobRelated !== 'boolean') throw new Error('model isJobRelated is invalid');
@@ -197,13 +171,7 @@ function validateOutput(value, input = {}) {
   const modelReturnedUnsupportedTime = !eventTimeIsSupported && (value.eventStart || value.eventEnd);
   let notesRaw = typeof value.notes === 'string' ? value.notes.trim() : '';
   const evidenceRaw = typeof value.evidence === 'string' ? value.evidence.trim().slice(0, 80) : '';
-  // Deduplicate: if notes equals evidence or contains evidence verbatim, drop duplication
-  if (notesRaw && evidenceRaw && (notesRaw === evidenceRaw || notesRaw.includes(evidenceRaw))) {
-    notesRaw = '';
-  }
-  if (notesRaw.length > 120) notesRaw = notesRaw.slice(0, 120);
-  const noteParts = notesRaw ? [notesRaw] : [];
-  if (modelReturnedUnsupportedTime) noteParts.push('时间未在邮件中明确出现，已忽略。');
+  if (notesRaw.length > 4_000) notesRaw = notesRaw.slice(0, 4_000);
   const result = {
     isJobRelated: value.isJobRelated,
     company: typeof value.company === 'string' ? value.company.trim() : '',
@@ -223,15 +191,6 @@ function validateOutput(value, input = {}) {
   if (result.position && isProcessWordPosition(result.position)) {
     result.position = '';
     result.needsReview = true;
-    noteParts.push('position 为流程词/邮件主题词，已置空待人工确认。');
-  }
-
-  // 防幻觉铁律：岗位名必须逐字出现在邮件原文里（subject 或正文），否则剥离并标人工复核
-  const corpus = `${input.subject || ''}\n${input.text || ''}`.trim().toLowerCase();
-  if (result.position && !corpus.includes(result.position.toLowerCase())) {
-    result.position = '';
-    result.needsReview = true;
-    noteParts.push('邮件未注明岗位名称，已留空待人工确认。');
   }
 
   // 线程归属：只放行 "new" 或确实存在于 openThreads 的整型 id，其余一律剥离
@@ -247,8 +206,21 @@ function validateOutput(value, input = {}) {
     const appliesTo = value.appliesTo.filter((id) => Number.isInteger(id) && knownThreadIds.has(id));
     if (appliesTo.length) result.appliesTo = appliesTo;
   }
+  if (result.status === '测评中' && value.appliesToAll === true) result.appliesToAll = true;
 
-  if (noteParts.length) result.notes = noteParts.join(' ').slice(0, 500);
+  result.company = resolveCompanyName({
+    company: result.company,
+    threadRef: result.threadRef,
+    openThreads: input.openThreads,
+    aliases: rules.companyAliases,
+  });
+
+  const notes = buildProgressNotes({
+    status: result.status,
+    notes: notesRaw,
+    eventEnd: result.eventEnd,
+  });
+  if (notes) result.notes = notes;
   return result;
 }
 
@@ -262,6 +234,7 @@ function responseContent(payload) {
 export function createLlmClassifier({
   provider,
   credentialStore,
+  rules = {},
   fetchImpl = globalThis.fetch,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 } = {}) {
@@ -275,33 +248,72 @@ export function createLlmClassifier({
       if (typeof fetchImpl !== 'function') throw new Error('fetch is unavailable');
       const headers = { 'content-type': 'application/json' };
       if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-      const requestBody = {
-        model: provider.model,
-        temperature: 0,
-        messages: [
-          { role: 'system', content: EXTRACTION_PROMPT },
-          { role: 'user', content: `${threadListContext(input.openThreads)}邮件接收时间 receivedAt：${receivedAtContext(input.receivedAt)}\n发件人：${String(input.sender || '').slice(0, 1_000)}\n主题：${String(input.subject || '').slice(0, 2_000)}\n正文：${String(input.text || '').slice(0, MAX_TEXT)}` },
-        ],
-        response_format: { type: 'json_object' },
+      const requestModel = async ({ system, user, maxTokens }) => {
+        const requestBody = {
+          model: provider.model,
+          temperature: 0,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+          ],
+          response_format: { type: 'json_object' },
+        };
+        if (provider?.id === 'deepseek' || /api\.deepseek\.com/i.test(String(provider?.baseUrl || ''))) {
+          requestBody.thinking = { type: 'disabled' };
+        }
+        if (provider?.id === 'openrouter' || /openrouter\.ai/i.test(String(provider?.baseUrl || ''))) {
+          requestBody.max_tokens = maxTokens;
+          requestBody.reasoning = { enabled: false };
+        }
+        const response = await fetchImpl(`${baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(requestBody),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (!response.ok) {
+          const error = new Error(`model request failed with status ${response.status}`);
+          error.status = response.status;
+          if (response.status === 429) error.code = 'MODEL_RATE_LIMITED';
+          throw error;
+        }
+        return extractJson(responseContent(await response.json()));
       };
-      if (provider?.id === 'deepseek' || /api\.deepseek\.com/i.test(String(provider?.baseUrl || ''))) {
-        requestBody.thinking = { type: 'disabled' };
-      }
-      if (provider?.id === 'openrouter' || /openrouter\.ai/i.test(String(provider?.baseUrl || ''))) {
-        requestBody.max_tokens = 600;
-        requestBody.reasoning = { enabled: false };
-      }
-      const body = JSON.stringify(requestBody);
-      const response = await fetchImpl(`${baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers,
-        body,
-        signal: AbortSignal.timeout(timeoutMs),
+
+      const analysisRaw = await requestModel({
+        system: EXTRACTION_PROMPT,
+        user: mailContext(input),
+        maxTokens: 700,
       });
-      if (!response.ok) throw new Error(`model request failed with status ${response.status}`);
-      const payload = await response.json();
+      const rawCompany = typeof analysisRaw.company === 'string'
+        ? analysisRaw.company.trim().slice(0, 200)
+        : '';
+      let canonicalCompany = resolveCompanyName({
+        company: rawCompany,
+        openThreads: input.openThreads,
+        aliases: rules.companyAliases,
+      });
+      const currentSenderIdentity = senderIdentityKey(input.sender);
+      if (currentSenderIdentity) {
+        const senderCompanies = [...new Set(
+          (Array.isArray(input.openThreads) ? input.openThreads : [])
+            .filter((thread) => senderIdentityKey(thread?.latestSender) === currentSenderIdentity)
+            .map((thread) => String(thread?.company || '').trim())
+            .filter(Boolean),
+        )];
+        if (senderCompanies.length === 1) canonicalCompany = senderCompanies[0];
+      }
       // 不回退原则：模型不可用/输出不合法时直接向上抛错，绝不用规则分类器兜底出结果
-      return validateOutput(extractJson(responseContent(payload)), input);
+      const result = validateOutput(
+        { ...analysisRaw, company: canonicalCompany, threadRef: 'new', appliesTo: undefined },
+        input,
+        rules,
+      );
+      if (result.position && isProcessWordPosition(result.position)) {
+        result.position = '';
+        result.needsReview = true;
+      }
+      return result;
     },
   };
 }

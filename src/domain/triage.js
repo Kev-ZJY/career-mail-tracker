@@ -8,7 +8,7 @@ const ANNOUNCEMENT_RULES = [
 
 const PROGRESS_RULES = [
   { signal: 'ended', pattern: /招聘流程.*结束|流程已结束|流程结束|岗位已关闭|职位已关闭|职位关闭|申请已结束|面试反馈问卷|招聘反馈问卷|流程反馈问卷|拒绝|未通过|很遗憾|遗憾地|暂不考虑|暂不推进|不再推进|rejection|unfortunately|regret|decline|decided not to proceed|not been successful|following up on your.*application|update.*application|已结束/i },
-  { signal: 'assessment', pattern: /测评|测评链接|在线测评|笔试|作业|coding\s*test|assessment|网申环节/i },
+  { signal: 'assessment', pattern: /测评|测评链接|在线测评|笔试|(?:在线)?作业(?:通知|任务|提交|截止)|coding\s*test|assessment|网申环节/i },
   { signal: 'offer', pattern: /offer|录用通知|正式聘用|薪资方案|入职意向|恭喜.*录用/i },
   { signal: 'interview', pattern: /面试邀请|面试安排|面试通知|预约面试|技术面|电话面|面试链接|群面|一面|二面|三面|终面|初面|复试|interview|onsite/i },
   { signal: 'submitted', pattern: /投递成功|申请已提交|收到.*申请|感谢.*申请|感谢投递|thanks for.*application|thank you for applying|顺利完成网申|完成网申|网申.*完成|申请已提交|申请编号|应聘.*岗位|简历.*收到|申请进展|申请结果/i },
@@ -16,6 +16,8 @@ const PROGRESS_RULES = [
 
 const GENERIC_JOB_WORDS = /招聘|应聘|offer|投递|申请|候选人|简历|面试|测评|笔试|录用|筛选|recruit|application|candidate|hiring/i;
 const PERSONAL_CONTEXT = /你|您|本人|候选人|申请|应聘|投递|简历|面试|测评|offer|your application|applicant|候选/i;
+const FAILED_SUBMISSION = /(?:职位)?投递失败|申请提交失败|未能提交(?:申请|简历)/i;
+const PERSONAL_SUBMISSION_CONFIRMATION = /(?:感谢.{0,50}(?:并|已)?投递\s*[^，。\n]{2,100}|(?:已经|已)收到.{0,24}(?:申请|简历)|(?:申请|投递)(?:已经|已)?提交成功|投递成功|成功投递)/i;
 
 // 满意度调研/面试体验等体验调查类邮件：只有明确说明上一轮流程招聘已结束（结束信号）
 // 才作为进度邮件保留；否则是信息性邮件，若进入列表会把进行中的申请错误标成「已结束」。
@@ -31,10 +33,22 @@ export function triageRecruitmentMessage({ subject = '', text = '', sender = '' 
   const header = `${subject}\n${sender}`.trim();
   const combined = `${subject}\n${sender}\n${text}`.trim();
   // 活动/系统/祝福/推荐/宣传类特征词几乎都在主题行；若用正文检测，邮件模板尾部
-  // 常见的「关注更多招聘活动」「了解更多宣讲会」会误伤真进度（如滴滴投递成功）。
+  // 常见的「关注更多招聘活动」「了解更多宣讲会」会误伤真实投递确认。
   // 进度信号（投递/测评/面试/结束）仍需全文检测。
   const announcement = matchedRule(ANNOUNCEMENT_RULES, header);
   const progress = matchedRule(PROGRESS_RULES, combined);
+
+  // 投递接口失败是一次技术失败，不代表招聘流程终止；若写入进度会把同公司
+  // 已成功投递的路线错误覆盖成「已结束」。
+  if (FAILED_SUBMISSION.test(combined)) {
+    return { decision: 'ignore', reason: '投递提交失败，不作为招聘流程状态', signal: 'failed-submission' };
+  }
+
+  // 部分 ATS 用「欢迎投递」作为个人投递成功邮件主题。
+  // 正文明确使用完成时确认已收到/已提交时，个人进度证据优先于宣传主题。
+  if (PERSONAL_SUBMISSION_CONFIRMATION.test(combined)) {
+    return { decision: 'analyze', reason: '检测到个人投递成功确认', signal: 'submitted' };
+  }
 
   // 活动/系统/祝福/宣传/推荐（subject 命中）是强忽略信号：
   // 用户已经投递的申请不会再收到「诚邀投递/校招启动/挑战赛」类主题，
