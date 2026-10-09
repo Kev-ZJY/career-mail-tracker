@@ -4,10 +4,6 @@ export function normalizeCompany(company) {
   return String(company || '').trim().replace(/\s+/g, ' ').slice(0, 200);
 }
 
-export function inferCompanyFromEvidence({ company = '' } = {}) {
-  return normalizeCompany(company);
-}
-
 export function normalizePositionName(value) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 300);
 }

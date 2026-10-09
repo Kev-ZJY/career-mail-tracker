@@ -1,6 +1,8 @@
+import { resolveTimeouts } from './services/deadline.js';
+
 const DEFAULT_PORT = 4317;
-// 每次改动提示词或默认模型都要 bump，否则存量邮件不会重新分析
-const ANALYSIS_VERSION = 'generic-mail-extraction-v2';
+// Bump only when extraction semantics change; this triggers reanalysis of saved mail.
+const ANALYSIS_VERSION = 'generic-mail-extraction-v7';
 
 export function createConfig(env = process.env) {
   const parsedPort = Number.parseInt(env.PORT ?? String(DEFAULT_PORT), 10);
@@ -13,5 +15,6 @@ export function createConfig(env = process.env) {
     dataDir,
     rulesFile: env.RULES_FILE || `${dataDir}/rules.toml`,
     analysisVersion: ANALYSIS_VERSION,
+    syncTimeouts: resolveTimeouts(env),
   };
 }

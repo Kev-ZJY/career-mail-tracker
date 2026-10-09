@@ -3,6 +3,13 @@ const ANNOUNCEMENT_RULES = [
   { signal: 'recommendation', pattern: /岗位推荐|职位推荐|推荐岗位|推荐职位|热门岗位|热招岗位|职位订阅|岗位订阅|职位提醒|职位快讯|为你推荐|职位匹配|智联推荐/i },
   { signal: 'promotion', pattern: /开放投递|开放报名|欢迎投递|招募中|申请攻略|求职攻略|招聘资讯|校招.*开放|培训生.*开放|机会.*攻略|投递邀请|招聘.*启动|校招.*启动|秋招.*启动|春招.*启动|诚邀.*投递|邀请.*投递|开启.*申请|诚邀你投递/i },
   { signal: 'system', pattern: /激活码|验证码|离职交接|注册邮箱|账号激活|登录确认|邮箱激活|密码重置/i },
+  // 退信/撤回失败这类邮件系统通知：标题里常引用原邮件主题（实测「通知：[撤回邮件
+  // 失败]回复：来自某公司的面试邀请」），若放行去问模型，标题里的流程词会让它被
+  // 判成面试/投递，而正文其实一句招聘内容都没有——模型在同一个输入上两次判断还
+  // 不一致（实测一次 isJobRelated=0、一次 =1），所以必须在进模型之前就拦掉。
+  // 配对边界：「投递失败」不在这里——它由 FAILED_SUBMISSION 单独处理，且那封要
+  // 留在库里以免覆盖同公司已成功投递的路线（见下方 FAILED_SUBMISSION 注释）。
+  { signal: 'system', pattern: /退信|撤回(?:邮件)?失败|撤回失败|邮件未送达|发送失败|被退回|delivery failed|undeliverable|mail delivery failed|mailer-daemon/i },
   { signal: 'greeting', pattern: /恭贺|贺禧|恭祝|新春快乐|新年快乐|happy new year|新禧/i },
 ];
 

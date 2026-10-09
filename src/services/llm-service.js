@@ -1,110 +1,64 @@
 import { buildProgressNotes } from '../domain/progress-notes.js';
+import { ALLOWED_PROGRESS_STATUSES } from '../domain/statuses.js';
 import { resolveCompanyName } from '../domain/company-resolver.js';
 import { senderIdentityKey } from '../domain/sender-identity.js';
+import { prepareBodyText } from '../domain/body-text.js';
+import { isReasoningOnly, resolveMaxTokens, TRUNCATION_RETRY_MAX_TOKENS } from './model-capabilities.js';
+import { DEFAULT_TIMEOUTS, withDeadline } from './deadline.js';
+import { normalizeModelBaseUrl } from './model-endpoint.js';
+import { redactErrorMessage } from '../domain/error-message.js';
+import { setTimeout as delay } from 'node:timers/promises';
 
-const STATUS = {
-  submitted: '已投递',
-  assessment: '测评中',
-  interview: '面试',
-  offer: 'Offer',
-  ended: '已结束',
-};
-
-const STATUS_VALUES = new Set(Object.values(STATUS));
-const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_TIMEOUT_MS = DEFAULT_TIMEOUTS.modelMs;
 const MAX_TEXT = 24_000;
 
-export const EXTRACTION_PROMPT = `你是“本地求职进度追踪器”的招聘邮件结构化解析器。你的任务是判断一封邮件是否代表“用户本人已经参与的某个招聘申请流程”，并提取它对招聘进度有用的信息。你只能根据输入的发件人、主题、正文和接收时间判断，不能臆测不存在的公司、职位、时间或状态。
+export const EXTRACTION_PROMPT = `你是招聘邮件结构化解析器。判断这封邮件是否代表用户本人已参与的招聘流程，并提取字段。不得臆造公司、岗位、时间、状态。只返回一个 JSON 对象，不要解释或额外字段。
 
-【输出纪律】
-只返回一个合法的 JSON 对象，不要 Markdown、解释、思维过程、前后缀或额外字段。所有字符串使用中文或邮件原文中的专有名词。confidence 必须是 0 到 1 的数字；证据必须引用邮件中实际出现的关键信号。
+{"isJobRelated":bool,"company":string,"position":string,"status":"已投递|测评中|面试|Offer|已结束","confidence":number,"evidence":string,"nextAction":string,"needsReview":bool,"threadRef":"new","appliesToAll":bool,"eventStart":string?,"eventEnd":string?,"notes":string?}
 
-【第一道判断：是否属于个人招聘进度】
-isJobRelated=true 仅适用于用户本人已经投递、申请、进入测评、收到面试安排、收到录用结果，或收到该申请流程结束/未通过通知的邮件。
-以下邮件不属于个人招聘进度，必须返回 isJobRelated=false，不能创建或更新某个公司的招聘进度：招聘活动、宣讲会、招聘会、双选会、招聘峰会、招聘活动预告；招聘网站的岗位推荐、职位订阅、职位提醒、热招岗位推送；批量营销、开放投递广告、求职/申请攻略、培训/课程推广、泛化的校园招聘资讯。邮件里出现“招聘”“岗位”“投递”等词，不代表它就是用户本人申请进度。
-“火热招聘中”“诚邀加入/申请”“立即投递”“申请截止日期”“面向应届生”等是在邀请收件人未来申请，不代表收件人已经完成申请；营销邮件用“你/您/同学”称呼收件人也不是个人进度证据。只有完成时或已发生的个人动作/结果（例如“已收到你的申请”“你已通过简历评估”）才能据此判为 true。
-判断顺序必须是：先在全文查找“已收到你的申请/简历”“感谢申请/投递”“邀请你完成测评/参加面试”“申请未通过”等指向用户本人的完成时进度证据；只要存在这类证据，isJobRelated 就是 true。只有全文都没有个人进度证据时，才根据活动、宣讲、推广或岗位推荐判断 false。招聘邮件在个人申请确认之后附带宣讲会、抽奖、二维码或品牌宣传很常见，这些尾部内容不得把前面的个人申请进度覆盖成 false。
-当 isJobRelated=false 时，status 仍必须填写“已结束”（这是为了满足统一字段枚举；该记录会被系统隐藏，不应显示在招聘进度列表中），needsReview=false，nextAction 写“不写入招聘进度列表”。
+【isJobRelated】
+true 仅限用户本人已发生的招聘动作或结果：投递成功、进入测评、收到面试安排、收到录用、收到该流程的拒绝或结束通知。
+false：宣讲会、招聘会、招聘活动预告；岗位推荐、职位订阅；批量营销、开放投递广告、求职攻略、课程推广、泛化校招资讯。
+「火热招聘中」「立即投递」「诚邀申请」是邀请未来申请，不算。「已收到你的申请」「你已通过简历评估」算。
+先找本人已发生动作的证据，找到即 true；都没有才判 false。本人进度之后附带的宣讲会、抽奖、二维码、品牌宣传不影响结果。
+公司主动联系算已发生：HR 来信说「你的简历与某岗位匹配、想继续沟通后续流程」——用户虽未回复，但对方已按用户本人简历发起了流程，算 true。只有群发的岗位推荐、没有指名用户简历的才算 false。
+false 时 status 填「已结束」，needsReview=false，nextAction 填「不写入招聘进度列表」。
 
-【status 只能使用以下五个值】
-1. 已投递：明确确认收到用户的申请/简历/投递，例如“感谢投递”“已收到你的申请”。
-2. 测评中：明确要求用户完成测评、笔试、作业或在线测试；只要邮件是测评通知，就不要因为正文提到“后续 Offer”而改成 Offer。
-3. 面试：明确邀请、安排、预约或确认用户参加面试/面谈/技术面/电话面。
-4. Offer：明确表示录用、发放 Offer、正式聘用、薪资方案或入职意向；不能把“Offer 机会”“Offer 攻略”“欢迎投递”等广告当作 Offer。
-5. 已结束：明确拒绝、未通过、暂不推进、不再推进、遗憾通知、岗位/流程关闭、申请结束，或邀请填写面试/招聘反馈问卷的邮件。拒绝不是单独的状态，统一归为已结束。
-绝对不要输出“待确认”“拒绝”“筛选中”这三个状态。如果邮件属于个人流程但证据不足，仍使用最符合证据的五个状态，并将 needsReview=true、confidence 调低；不要把缺失项或低置信度原因写进 notes。如果完全无法确认是个人流程，则按上面的 isJobRelated=false 处理。
+【status】只能取这五个值：
+已投递——邮件确认收到了用户的申请。
+测评中——邮件要求用户做测评、笔试或作业。即使提到后续 Offer，也仍填测评中。
+面试——邮件邀请、安排或确认用户参加面试。
+Offer——邮件表示录用、发 offer、给薪资方案或入职意向。
+已结束——拒绝、未通过、暂不推进、岗位关闭、流程结束，或邀请填写面试/招聘反馈问卷。拒绝归入已结束。
+已经为用户安排好的动作被撤回时也归入已结束：面试取消、测评终止、Offer 撤销。只看这件事本身是否发生，不看句子里有没有「取消」两个字——页脚的「取消订阅」、诚信条款里的「一经发现将取消面试资格/应聘资格」都与用户本次流程无关，不能据此判已结束。
+禁止输出「待确认」「拒绝」「筛选中」。
+一封邮件同时命中多个时按此顺序取一个：已结束 > 测评中 > Offer > 面试 > 已投递。
+注意区分主流程和附带动作：面试通知里附带「请扫描二维码完成在线测评」，主流程是面试，status 填「面试」。
 
-【冲突判断优先级】
-已结束 > 测评中 > Offer > 面试 > 已投递。优先使用明确的终态/事件信号。例如“面试反馈问卷 + 流程已结束”必须是已结束；“测评 + 后续 Offer 流程”必须是测评中；“岗位推荐 + 投递入口”仍是非个人进度。
+【company】填本次实际用人主体。
+不填：邮件服务商、ATS 或招聘平台名、部门、项目名、岗位名、发件邮箱域名。
+集团和具体子公司同时出现时填更具体的那个。
+邮件里有中文名就填中文名，只有英文名才填英文名。
+填不出来就填 ""。
 
-【时间与日期规则】
-输入会提供邮件接收时间 receivedAt，并注明北京时间。邮件只写月/日而没有年份时，使用 receivedAt 对应的北京时间年份，绝不要擅自使用 2025 或其他年份。只在邮件明确给出时间时填写 eventStart/eventEnd；没有明确面试时间就不要编造时间。测评邮件只有截止时间时，eventStart=receivedAt，eventEnd=测评截止时间；如果截止时间只有月/日，也按 receivedAt 的北京时间年份解析。时间必须是可解析的 ISO 8601 字符串，保留精确到分钟的信息。
+【position】填用户这次应聘的具体岗位名。这是本任务最容易出错的地方，判定标准只有一个：
+问自己——邮件里有没有一句话或一个字段，把一个具体的职业角色直接连到「用户要应聘它」上？
+· 有 → 填那个角色名。常见句式：「收到您对 <岗位> 的申请」「<岗位>岗位的面试」「职位/岗位名称：<岗位>」「【面试职位】：<岗位>」「试卷名称：<岗位>」。字段值读到字段结束为止，括号、破折号、斜线里的业务方向要保留。
+· 没有 → 填 ""。不要用公司名、批次名、活动名去凑。
+必须排除的词（这些是流程或考试形式，不是岗位）：群面、无领导小组、综合测评、人才测评、在线测评、测评邀请、面试邀请、视频面试、业务面试、笔试、笔试邀请、现场访客码、访客码、通知、反馈、投递成功、未提及、问卷、一面、二面、终面。
+容易误判的一种情况：「<招聘批次>-<角色>试卷-<日期>」是给所有考生用的批量试卷名，不代表某个人投了这个岗位，填 ""。但如果整封邮件只服务于收件人一个人（以「尊敬的 <姓名>」开头，全文只讲这一份申请），那试卷名里的角色就是他的岗位，应当填上。
+只省掉纯冗余的部分：开头重复的公司名、结尾重复的「岗位/职位」字样、届次与招聘年份（如「2027届」）、校招批次。
+部门、业务方向、城市不是冗余——它们区分同一个公司的不同岗位，省掉就认不出投的是哪个岗，要保留（如「研发部工程师（示例城市）」原样填，不要压成「工程师」）。
+反过来，保留规则也不等于宽松：邮件点名了项目、计划、专项的名称而这就是用户投的那个项目时，照填（如「示例全球培训计划（Example Global Program）」填成它，不要因为名字里没有「岗位」二字就留空）。只有邮件确实没给出任何角色名时，才填 ""。
+英文岗位同样要填。后半段附带的宣讲或营销内容不能改掉前面已经明确的岗位。
 
-【字段契约】
-必须返回以下字段：
-{
-  "isJobRelated": boolean,
-  "company": string,
-  "position": string,
-  "status": "已投递" | "测评中" | "面试" | "Offer" | "已结束",
-  "confidence": number,
-  "evidence": string,
-  "nextAction": string,
-  "needsReview": boolean,
-  "threadRef": "new"（历史申请由系统在本地归并，不要猜测编号）,
-  "appliesToAll": boolean（仅测评邮件明确覆盖本人已投递的全部岗位时为 true，否则 false；不需要知道历史线程）,
-  "eventStart": string（有明确时间时填写，否则省略）, 
-  "eventEnd": string（有明确结束/截止时间时填写，否则省略）, 
-  "notes": string（可选，见精简要求）
-}
+【时间】邮件只写月/日没有年份时，用输入里 receivedAt 的北京时间年份。只在邮件明确给出时间时填 eventStart/eventEnd。测评只给截止时间时 eventStart=receivedAt、eventEnd=截止时间。格式必须是可解析的 ISO 8601。没有明确面试时间就不要编造。
 
-【company 抽取与统一｜必须遵守】
-1. 综合发件人显示名、主题、正文中的申请对象与落款提取本次实际用人/招聘主体。发件人显示名是明确的公司或招聘品牌时属于强证据；除非正文明确说明用户申请的是另一用人单位，否则不要被岗位、项目或计划名中看似公司的词覆盖。
-2. 不把邮件服务商、ATS/招聘平台、部门、项目团队、招聘计划、岗位名或发件邮箱域名直接当成公司。上级集团与本次明确招聘的子公司、研究院、研究所或事业单位同时出现时，优先最具体的用人单位。
-3. 公司同时出现中文名和英文名时，company 必须优先输出最明确的中文名称；只有邮件全文确实没有中文名称时才输出英文名称。即使发件人显示名是英文品牌，只要主题、正文申请对象或落款明确给出同一主体的中文名，也必须返回中文名，不能因为发件人排在最前面就保留英文名。
-4. 只根据本封邮件判断招聘主体。集团母公司、旗下独立子公司、不同事业品牌不能仅因共享集团字样就算同一主体；公司名称的历史统一由系统在本地完成。
-5. 邮件无法确认公司时 company 返回空字符串，不从岗位或历史记录猜造。
+【threadRef】固定填 "new"。历史申请由系统在本地归并，不要输出历史线程编号。只当测评邮件写了「全部申请岗位」「所有已投递岗位」这类覆盖范围时 appliesToAll=true。
 
-公司边界：发件人显示名是招聘主体，而正文仅在项目或计划名中出现另一个组织词时，不要仅凭该词改写 company；集团与明确负责本次招聘的下属单位同时出现时，选择下属单位；同一主体同时有中文与英文名称时，优先输出邮件中的中文名称。
-
-【position 抽取规则｜必须遵守】
-position 是用户这次申请的具体岗位名称。你需要完整阅读主题和正文后进行语义提取，而不是依赖固定模板或只看某一行。
-先在内部列出所有看起来像角色名称的片段，再区分它们与用户申请的关系：只有被“申请、应聘、投递、收到申请、面试岗位”等语义直接指向的片段才是岗位；位于试卷、测评、考试、活动或项目名称中的片段不是岗位。不要输出这份内部列表。
-1. 最高优先级检查“收到您对 <职位名> 的申请”“申请/应聘/投递 <职位名>”“职位/岗位名称：<职位名>”等能把用户申请动作与具体角色直接连接起来的语义。“职位/岗位名称”字段后的值必须完整读取到该字段结束，括号、破折号或斜线中的业务方向不得删除。岗位可能位于主题、申请确认段、面试/测评说明、拒绝说明、中英文句子或较长段落中；否定句中的岗位仍是有效岗位，例如“未通过 <职位名> 的筛选”。邮件后半段即使附带宣讲、活动或营销内容，也不能覆盖前文已经明确的个人申请岗位。
-2. 邮件明确出现具体岗位时，position 不得返回空字符串。输出岗位本体即可；允许省略公司名、部门冗余、城市、届次、招聘年份、校招批次和重复的“岗位/职位”后缀，也要剔除紧贴在岗位前后的日期时间、候选人姓名和申请编号。不要因为不能逐字照抄整段长名称而放弃岗位；必须保留能区分岗位的核心名称与方向。
-3. 英文岗位同样必须提取并保留必要方向，不得因为岗位较长或邮件为英文而留空。
-4. 纯招聘批次、校园招聘项目、活动名、测评名称、试卷名称、考试科目、流程阶段和面试形式不是具体岗位。特别注意：角色词若只出现在试卷、测评或考试名称中，它仍然只是流程标签，position 必须为 ""。正文只说“意向岗位或调剂岗位涉及笔试”也没有给出具体岗位。若项目或计划名称本身包含具体职业角色，且邮件明确表示用户已参与该角色的个人申请流程，仍应提取这个角色；没有具体职业角色的项目名才留空。
-5. 严禁把面试邀请、测评邀请、视频面试、能力测评、业务面试、在线测评、面试安排、访客码、面试、测评、笔试、群面、一面、二面、终面、通知、反馈、投递成功、未提及、问卷等流程词填入 position。
-6. 只有邮件原文确实没有具体岗位时，position 才返回空字符串 ""。此时禁止根据公司或常识补全。
-7. 正文最多提供前 24000 字符。若可见内容已出现岗位就必须提取；若全部可见内容都没有具体岗位，则返回空字符串，不以 needsReview 代替岗位提取。
-8. 非空 position 必须通过必要条件：邮件中存在一句话或一个字段，明确表达“用户申请/应聘/投递/面试的是这个角色”。邀请参加考试只能证明流程状态，不能证明试卷标题里的角色就是申请岗位；试卷名称、测评名称、考试名称永远不能满足这个必要条件。
-9. 返回 JSON 前必须在内部做双向复核：如果准备返回空 position，重新查找用户申请动作是否直接带出具体角色；如果准备返回非空 position，逐字回答“邮件哪句话明确说用户申请的是这个角色”。若答案只能引用试卷/测评/考试/项目/活动名称，必须把 position 改成 ""。不要输出复核过程，也不要增加字段。
-
-【申请线程归属】
-本次输入不包含历史申请线程。threadRef 固定返回 "new"，不要输出不存在的线程编号，也不要输出 appliesTo。若测评邮件明确写“全部申请岗位”“所有已投递岗位”等覆盖范围，则 appliesToAll=true；仅提到一个岗位或无法确认覆盖范围时为 false。系统会在本地根据公司、岗位和进度归并申请；这不影响你在同一次请求中完整提取本封邮件的公司、岗位、状态和时间。
-
-【精简要求｜防冗余】
-- evidence 只写 1 句、最长 80 字，必须逐字引用邮件中的关键短语，不要复述整段或重复 notes。
-- notes 不是分析解释栏：已投递、Offer、已结束的 notes 必须返回空字符串 ""。
-- 测评中的 notes 最多只写一个可点击的测评/笔试链接；测评截止时间写入 eventEnd，由系统统一展示。
-- 面试的 notes 最多只写一个可点击的面试/会议链接。
-- 备注禁止出现邮件原文摘录、“岗位未识别/待确认”、时间缺失、低置信度原因或 evidence 的重复内容；没有上述允许链接时返回空字符串 ""。
-- nextAction 用动词开头、15 字以内（如“完成测评”“确认面试时间”）。
-- 不要把泛化广告中的公司/职业硬写成个人进度。
-
-【输出前最后检查｜优先级最高】
-- 先忽略纯试卷名称、纯测评名称、纯考试名称、招聘活动名和不含职业角色的项目名，再判断邮件是否仍明确写出了用户申请的具体岗位。不要机械忽略“申请/应聘/投递”的直接宾语：如果该宾语包含明确职业角色，它就是岗位候选，即使名称里还含品牌、计划、项目或括号说明。
-- 如果忽略这些名称后没有具体岗位，position 必须是 ""；“意向岗位/调剂岗位”只是泛称，不是具体岗位。
-- 如果忽略这些名称后仍有“申请/应聘/投递 <具体岗位>”“收到对 <具体岗位> 的申请”等直接关系，必须提取该岗位，不能留空。
-- “我们已收到您对 <具体岗位> 的申请”必须提取该岗位的完整角色与方向；不得仅因名称像人才计划或带括号说明而置空。
-- 边界示例：“您投递的意向岗位如涉及笔试，请完成考试。试卷名称：<招聘批次>-<角色词>试卷-<日期>。”应输出 position=""，因为角色词只属于试卷名称。
-- 正向示例：“我们已收到您对 <具体岗位> 的申请。下方是宣讲会和抽奖信息。”应输出 position="<具体岗位>"，因为申请动作直接连接具体岗位，后续宣传不能覆盖它。
-- 本检查覆盖前文中任何可能产生歧义的说明。`;
-
-function cleanBaseUrl(value) {
-  if (typeof value !== 'string' || value.trim() === '') throw new Error('model baseUrl is required');
-  return value.trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
-}
+【evidence】一句话、80 字以内，逐字引用邮件里的关键短语。
+【notes】已投递、Offer、已结束填 ""；测评中最多填一个测评链接，截止时间写进 eventEnd；面试最多填一个面试链接。禁止写「岗位未识别」或低置信度原因。
+【nextAction】动词开头，15 字以内，例如「完成测评」「确认面试时间」。`;
 
 function extractJson(value) {
   const text = String(value || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
@@ -129,8 +83,10 @@ function receivedAtContext(value) {
   return `${value}；北京时间：${beijing}`;
 }
 
-function mailContext(input, suffix = '') {
-  return `邮件接收时间 receivedAt：${receivedAtContext(input.receivedAt)}\n发件人：${String(input.sender || '').slice(0, 1_000)}\n主题：${String(input.subject || '').slice(0, 2_000)}\n正文：${String(input.text || '').slice(0, MAX_TEXT)}${suffix}`;
+function mailContext(input) {
+  // 正文先剥内嵌 base64 图片再截断：截断额度不能被二维码垃圾占满，
+  // 否则真正含岗位信息的正文会被切掉。详见 domain/body-text.js。
+  return `邮件接收时间 receivedAt：${receivedAtContext(input.receivedAt)}\n发件人：${String(input.sender || '').slice(0, 1_000)}\n主题：${String(input.subject || '').slice(0, 2_000)}\n正文：${prepareBodyText(input.text, MAX_TEXT)}`;
 }
 
 function hasExplicitEventTime({ subject = '', text = '' } = {}) {
@@ -142,13 +98,12 @@ function hasExplicitEventTime({ subject = '', text = '' } = {}) {
 const POSITION_BLACKLIST = new Set([
   '面试邀请', '测评邀请', '现场访客码', '面试', '测评', '未提及', '通知', '应聘反馈',
   '简历投递成功', '面试反馈', '访客码', '简历投递', '投递成功', '反馈', '问卷', '招聘',
-  '职位', '职位名称', '岗位', '岗位名称',
-  '一面通知', '面试通知', '测评通知', '投递邀请', '简历更新邀请', '应聘反馈通知', '满意度问卷',
-  '视频面试', '能力测评', '业务面试', '在线测评', '面试安排', '面试体验', '面试邀约',
-  '线上面试', '现场面试', '电话面试', '技术面试', '群面', '单面', '一面', '二面', '终面',
-  '笔试', '面试确认', '面试预约', '面试结果', '流程通知', '简历筛选', '投递反馈', '面试',
-  '测评', '群面通知', '面试反馈', '招聘反馈', '人才测评', '笔试邀请', '综合能力测试',
-  'AI编程考察', '编程考察', '能力测试', '综合测评', '通用能力测评',
+  '职位', '职位名称', '岗位', '岗位名称', '一面通知', '面试通知', '测评通知', '投递邀请',
+  '简历更新邀请', '应聘反馈通知', '满意度问卷', '视频面试', '能力测评', '业务面试', '在线测评', '面试安排',
+  '面试体验', '面试邀约', '线上面试', '现场面试', '电话面试', '技术面试', '群面', '单面',
+  '一面', '二面', '终面', '笔试', '面试确认', '面试预约', '面试结果', '流程通知',
+  '简历筛选', '投递反馈', '群面通知', '招聘反馈', '人才测评', '笔试邀请', '综合能力测试', 'AI编程考察',
+  '编程考察', '能力测试', '综合测评', '通用能力测评',
 ]);
 
 function normalizePosition(value) {
@@ -163,7 +118,7 @@ function isProcessWordPosition(value) {
 
 function validateOutput(value, input = {}, rules = {}) {
   if (!value || typeof value !== 'object') throw new Error('model output is invalid');
-  if (!STATUS_VALUES.has(value.status)) throw new Error('model status is invalid');
+  if (!ALLOWED_PROGRESS_STATUSES.has(value.status)) throw new Error('model status is invalid');
   if (typeof value.isJobRelated !== 'boolean') throw new Error('model isJobRelated is invalid');
   const confidence = Number(value.confidence);
   if (!Number.isFinite(confidence)) throw new Error('model confidence is invalid');
@@ -182,6 +137,11 @@ function validateOutput(value, input = {}, rules = {}) {
     nextAction: typeof value.nextAction === 'string' ? value.nextAction.trim().slice(0, 30) : '',
     needsReview: Boolean(value.needsReview) || Boolean(modelReturnedUnsupportedTime),
   };
+  // Conflicting non-recruitment outputs stay out of the timeline and require review.
+  if (!result.isJobRelated && result.status !== '已结束') {
+    result.status = '已结束';
+    result.needsReview = true;
+  }
   const eventStart = eventTimeIsSupported ? validIso(value.eventStart) : undefined;
   const eventEnd = eventTimeIsSupported ? validIso(value.eventEnd) : undefined;
   if (eventStart) result.eventStart = eventStart;
@@ -231,6 +191,46 @@ function responseContent(payload) {
     || '';
 }
 
+function modelResponseError(payload, status) {
+  const upstreamCode = Number(payload?.error?.code);
+  const effectiveStatus = status === 200 && Number.isInteger(upstreamCode) && upstreamCode >= 400 ? upstreamCode : status === 200 ? 503 : status;
+  const rawDetail = typeof payload?.error === 'string' ? payload.error : payload?.error?.message || payload?.message;
+  const detail = redactErrorMessage(rawDetail);
+  const failures = {
+    400: ['MODEL_CONFIG_INVALID', '模型请求参数不被支持，请检查模型与接口配置'],
+    401: ['MODEL_AUTH_FAILED', '模型认证失败，请检查 API key'],
+    402: ['MODEL_PAYMENT_REQUIRED', '模型账户额度不足'],
+    403: ['MODEL_ACCESS_DENIED', '模型访问被拒绝，请检查账户权限与供应商限制'],
+    404: ['MODEL_NOT_FOUND', '模型或接口不可用（404），请检查兼容协议地址、模型名称及可用端点'],
+    429: ['MODEL_RATE_LIMITED', '模型额度或调用频率已达上限'],
+  };
+  const [code, message] = failures[effectiveStatus] || ['MODEL_REQUEST_FAILED', `模型上游请求失败（${effectiveStatus}）`];
+  return Object.assign(new Error(`${message}${detail ? `：${detail}` : ''}`), { code, status: effectiveStatus });
+}
+
+// 不同上游对「是否允许关闭 reasoning」的要求相反：DeepSeek 走 thinking.disabled，
+// OpenRouter 上的多数模型可以显式关闭，但 reasoning-only 端点**强制要求** reasoning，
+// 下发 reasoning:{enabled:false} 会直接 400（判定见 model-capabilities.js）。
+function isOpenRouter(provider) {
+  return provider?.id === 'openrouter' || /openrouter\.ai/i.test(String(provider?.baseUrl || ''));
+}
+
+function buildRequestOverrides(provider) {
+  const overrides = {};
+  if (provider?.id === 'deepseek' || /api\.deepseek\.com/i.test(String(provider?.baseUrl || ''))) {
+    overrides.thinking = { type: 'disabled' };
+  }
+  if (isOpenRouter(provider)) {
+    // reasoning-only 端点不允许下发 reasoning:{enabled:false}（会 400），
+    // 此时完全不下发该字段，由服务端默认开启。
+    if (!isReasoningOnly(provider)) {
+      if (provider.reasoning !== undefined) overrides.reasoning = provider.reasoning;
+      else overrides.reasoning = { enabled: false };
+    }
+  }
+  return overrides;
+}
+
 export function createLlmClassifier({
   provider,
   credentialStore,
@@ -239,11 +239,21 @@ export function createLlmClassifier({
   timeoutMs = DEFAULT_TIMEOUT_MS,
 } = {}) {
   return {
-    async classify(input = {}) {
-      const baseUrl = cleanBaseUrl(provider?.baseUrl);
+    async checkConnection({ signal } = {}) {
+      // Only transient transport / upstream failures retry, within the caller's probe deadline.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try { return await this.classify({}, { signal, connectivityOnly: true }); }
+        catch (error) {
+          if (signal?.aborted || attempt === 2 || !(error.code === 'MODEL_REQUEST_FAILED' && error.status >= 500)) throw error;
+          await delay(250 * (attempt + 1), undefined, { signal });
+        }
+      }
+    },
+    async classify(input = {}, { signal = input.signal, connectivityOnly = false } = {}) {
+      const baseUrl = normalizeModelBaseUrl(provider?.baseUrl);
       const apiKey = provider?.credentialRef ? credentialStore?.get(provider.credentialRef) : null;
       if (provider?.credentialRequired !== false && provider?.id !== 'ollama' && !apiKey) {
-        throw new Error('model credential is not configured');
+        throw Object.assign(new Error('model credential is not configured'), { code: 'MODEL_AUTH_FAILED' });
       }
       if (typeof fetchImpl !== 'function') throw new Error('fetch is unavailable');
       const headers = { 'content-type': 'application/json' };
@@ -258,32 +268,82 @@ export function createLlmClassifier({
           ],
           response_format: { type: 'json_object' },
         };
-        if (provider?.id === 'deepseek' || /api\.deepseek\.com/i.test(String(provider?.baseUrl || ''))) {
-          requestBody.thinking = { type: 'disabled' };
-        }
-        if (provider?.id === 'openrouter' || /openrouter\.ai/i.test(String(provider?.baseUrl || ''))) {
+        const overrides = buildRequestOverrides(provider);
+        // 只有 OpenRouter 侧需要显式 max_tokens；reasoning-only 端点无论挂在哪都必须显式下发，
+        // 否则会用服务端默认值，思考 token 挤掉最终 JSON。
+        if (isOpenRouter(provider) || isReasoningOnly(provider)) {
           requestBody.max_tokens = maxTokens;
-          requestBody.reasoning = { enabled: false };
         }
-        const response = await fetchImpl(`${baseUrl}/chat/completions`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(requestBody),
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-        if (!response.ok) {
-          const error = new Error(`model request failed with status ${response.status}`);
-          error.status = response.status;
-          if (response.status === 429) error.code = 'MODEL_RATE_LIMITED';
+        Object.assign(requestBody, overrides);
+        let payload;
+        try {
+          payload = await withDeadline(async (requestSignal) => {
+            const response = await fetchImpl(`${baseUrl}/chat/completions`, {
+              method: 'POST', headers, body: JSON.stringify(requestBody), signal: requestSignal,
+            });
+            if (!response.ok) {
+              let upstream;
+              try { upstream = await response.json(); } catch { /* Non-JSON error pages still have an HTTP status. */ }
+              throw modelResponseError(upstream, response.status);
+            }
+            const result = await response.json();
+            if (result?.error) throw modelResponseError(result, response.status);
+            return result;
+          }, { timeoutMs, signal, code: 'MODEL_TIMEOUT', label: '模型请求与响应读取' });
+        } catch (cause) {
+          // AbortSignal.timeout 抛 DOMException{name:'TimeoutError'}，不带 code。
+          // 标记后上层可区分「上游卡死」与「网络抖动」——前者重试没有意义。
+          if (!cause?.code && (cause?.name === 'TimeoutError' || cause?.name === 'AbortError')) {
+            const error = new Error(`model request timed out after ${timeoutMs}ms`);
+            error.code = 'MODEL_TIMEOUT';
+            error.cause = cause;
+            throw error;
+          }
+          throw cause;
+        }
+        // A truncated response is invalid even when it contains a partial JSON object.
+        if (payload?.choices?.[0]?.finish_reason === 'length') {
+          const error = new Error('model output was truncated by the max_tokens budget');
+          error.code = 'MODEL_OUTPUT_TRUNCATED';
+          error.finishReason = 'length';
+          error.contentChars = String(payload?.choices?.[0]?.message?.content || '').length;
           throw error;
         }
-        return extractJson(responseContent(await response.json()));
+        try {
+          return extractJson(responseContent(payload));
+        } catch (cause) {
+          // 只在「完全没拿到内容」时算截断；内容存在但 JSON 不合法仍按可重试处理。
+          if (!String(responseContent(payload)).trim()) {
+            const error = new Error('model returned no usable content');
+            error.code = 'MODEL_OUTPUT_TRUNCATED';
+            error.cause = cause;
+            throw error;
+          }
+          throw cause;
+        }
       };
 
-      const analysisRaw = await requestModel({
+      if (connectivityOnly) {
+        const pong = await requestModel({ system: '只返回一个 JSON 对象：{"ok":true}', user: '确认当前模型可以正常响应。', maxTokens: resolveMaxTokens(provider) });
+        if (pong?.ok !== true) throw Object.assign(new Error('模型连通性确认未返回有效 JSON'), { code: 'MODEL_PREFLIGHT_FAILED' });
+        return { ok: true };
+      }
+
+      // Increase the output budget once for truncation, within the whole-mail deadline.
+      const requestWithEscalation = async (request) => {
+        const baseMaxTokens = resolveMaxTokens(provider);
+        try {
+          return await requestModel({ ...request, maxTokens: baseMaxTokens });
+        } catch (error) {
+          if (error?.code !== 'MODEL_OUTPUT_TRUNCATED') throw error;
+          if (baseMaxTokens >= TRUNCATION_RETRY_MAX_TOKENS) throw error;
+          return requestModel({ ...request, maxTokens: TRUNCATION_RETRY_MAX_TOKENS });
+        }
+      };
+
+      const analysisRaw = await requestWithEscalation({
         system: EXTRACTION_PROMPT,
         user: mailContext(input),
-        maxTokens: 700,
       });
       const rawCompany = typeof analysisRaw.company === 'string'
         ? analysisRaw.company.trim().slice(0, 200)
@@ -309,10 +369,6 @@ export function createLlmClassifier({
         input,
         rules,
       );
-      if (result.position && isProcessWordPosition(result.position)) {
-        result.position = '';
-        result.needsReview = true;
-      }
       return result;
     },
   };

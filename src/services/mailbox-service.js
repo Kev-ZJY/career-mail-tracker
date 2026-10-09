@@ -1,44 +1,24 @@
 import { getMailboxProvider } from '../mail/provider-registry.js';
-
-function requiredText(value, field) {
-  if (typeof value !== 'string' || value.trim() === '') throw new Error(`${field} is required`);
-  return value.trim();
-}
-
-async function defaultClientFactory(options) {
-  const { ImapFlow } = await import('imapflow');
-  return new ImapFlow(options);
-}
+import { DEFAULT_TIMEOUTS, withDeadline } from './deadline.js';
+import { buildImapOptions, createImapClient } from './imap-connection.js';
 
 export function createMailboxService({
-  credentialStore,
   providerRegistry = getMailboxProvider,
-  clientFactory = defaultClientFactory,
+  clientFactory = createImapClient,
+  env = process.env,
+  timeouts: timeoutOverrides = {},
 } = {}) {
-  if (!credentialStore) throw new Error('credentialStore is required');
-
-  function buildConnectionOptions({ provider, email, authorizationCode }) {
-    const profile = providerRegistry(provider);
-    return {
-      profile,
-      options: {
-        host: profile.host,
-        port: profile.port,
-        secure: profile.secure,
-        auth: { user: requiredText(email, 'email'), pass: requiredText(authorizationCode, 'authorizationCode') },
-        logger: false,
-      },
-    };
-  }
-
+  const timeouts = { ...DEFAULT_TIMEOUTS, ...timeoutOverrides };
   return {
-    buildConnectionOptions,
-
-    async testConnection(input) {
-      const { profile, options } = buildConnectionOptions(input);
-      const client = await clientFactory(options);
+    async testConnection(input, { signal } = {}) {
+      const profile = providerRegistry(input.provider);
+      const options = buildImapOptions(profile, input, { env, timeouts });
+      const client = await withDeadline(() => clientFactory(options), { timeoutMs: timeouts.connectMs, signal, code: 'IMAP_CONNECT_TIMEOUT', label: '创建邮箱连接' });
+      client.on?.('error', () => {});
+      const close = () => { try { client.close?.(); } catch { /* already closed */ } };
+      signal?.addEventListener('abort', close, { once: true });
       try {
-        await client.connect();
+        await withDeadline(() => client.connect(), { timeoutMs: timeouts.connectMs, signal, code: 'IMAP_CONNECT_TIMEOUT', label: '邮箱连接' });
         return {
           ok: true,
           provider: profile.id,
@@ -47,6 +27,7 @@ export function createMailboxService({
           mailbox: 'INBOX',
         };
       } catch (error) {
+        close();
         return {
           ok: false,
           provider: profile.id,
@@ -55,17 +36,11 @@ export function createMailboxService({
           message: error instanceof Error ? error.message : 'IMAP connection failed',
         };
       } finally {
+        signal?.removeEventListener('abort', close);
         if (typeof client.logout === 'function') {
-          try { await client.logout(); } catch { /* connection already closed */ }
+          try { await withDeadline(() => client.logout(), { timeoutMs: timeouts.logoutMs, code: 'IMAP_LOGOUT_TIMEOUT', label: '退出邮箱连接' }); } catch { close(); }
         }
       }
-    },
-
-    saveCredentials({ provider, email, authorizationCode }) {
-      const normalizedProvider = requiredText(provider, 'provider');
-      const normalizedEmail = requiredText(email, 'email');
-      const credentialRef = credentialStore.save(requiredText(authorizationCode, 'authorizationCode'));
-      return { provider: normalizedProvider, email: normalizedEmail, credentialRef };
     },
   };
 }

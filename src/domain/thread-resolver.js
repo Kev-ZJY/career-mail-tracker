@@ -1,11 +1,6 @@
 import { companyComparisonKey } from './company-resolver.js';
 
-const STATUS_ORDER = ['已结束', '测评中', 'Offer', '面试', '已投递'];
 const RECENT_POSITION_INHERITANCE_MS = 30 * 24 * 60 * 60 * 1000;
-
-function threadStatusPriority(status) {
-  return STATUS_ORDER.indexOf(status);
-}
 
 function isEnded(status) {
   return status === '已结束';
@@ -61,11 +56,15 @@ export function resolveThreadPlacement({ threads = [], analysis = {}, message = 
 
   // Helper: find thread by exact (company, position) match
   function findExact(company, position) {
-    return activeThreads.find(t =>
+    const matches = activeThreads.filter(t =>
       sameCompany(t.company, company) &&
       samePosition(t.position, position) &&
       (position || isRecentThread(t, message))
     );
+    if (matches.length > 1 && matches.some(t => t.manualSeparate)) needsReview = true;
+    // An explicit split remains distinct. New mail without a confirmed owner
+    // stays on the original route and is marked for review when names collide.
+    return matches.sort((a,b) => Number(Boolean(a.manualSeparate))-Number(Boolean(b.manualSeparate)) || a.id-b.id)[0];
   }
 
   function findEndedExact(company, position) {

@@ -11,8 +11,3 @@ export function senderIdentityKey(value) {
   if (match[2].split('.').length === 2) return `${match[1]}@${match[2]}`;
   return '';
 }
-
-export function sameSenderIdentity(left, right) {
-  const leftKey = senderIdentityKey(left);
-  return Boolean(leftKey) && leftKey === senderIdentityKey(right);
-}

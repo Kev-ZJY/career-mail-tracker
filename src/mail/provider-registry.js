@@ -64,7 +64,3 @@ export function getMailboxProvider(id, env) {
   const resolved = resolveEndpoint(id, env);
   return { ...provider, ...resolved };
 }
-
-export function listMailboxProviders() {
-  return Object.values(MAILBOX_PROVIDERS).map((provider) => ({ ...provider }));
-}

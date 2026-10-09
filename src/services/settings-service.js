@@ -1,10 +1,12 @@
+import { normalizeModelBaseUrl } from './model-endpoint.js';
+
 const defaultProviders = [
   {
     id: 'openrouter',
     name: 'OpenRouter',
     protocol: 'openai-compatible',
     baseUrl: 'https://openrouter.ai/api/v1',
-    model: 'nvidia/nemotron-3.5-lightning:free',
+    model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
     credentialRequired: true,
   },
   {
@@ -40,6 +42,11 @@ function cleanText(value, field) {
   return value.trim();
 }
 
+function mergeProviderProfile(base, saved) {
+  // A saved model is an explicit choice; do not silently migrate or replace it.
+  return { ...base, ...saved };
+}
+
 function serializeProvider(profile, credentialStore) {
   return {
     id: profile.id,
@@ -65,10 +72,10 @@ export function createSettingsService({ repository, credentialStore }) {
   return {
     getSettings() {
       const savedProviders = repository.getSetting('model.providers', {});
-      const providers = defaultProviders.map((provider) => serializeProvider({
-        ...provider,
-        ...(savedProviders[provider.id] || {}),
-      }, credentialStore));
+      const providers = defaultProviders.map((provider) => serializeProvider(
+        mergeProviderProfile(provider, savedProviders[provider.id]),
+        credentialStore,
+      ));
       for (const [id, provider] of Object.entries(savedProviders)) {
         if (!providers.some((item) => item.id === id)) {
           providers.push(serializeProvider(provider, credentialStore));
@@ -76,6 +83,7 @@ export function createSettingsService({ repository, credentialStore }) {
       }
       return {
         providers,
+        activeProviderId: repository.getSetting('model.activeId', 'openrouter'),
         mailbox: serializeMailbox(repository.getSetting('mailbox.account'), credentialStore),
       };
     },
@@ -83,9 +91,10 @@ export function createSettingsService({ repository, credentialStore }) {
     saveProvider(input) {
       const id = cleanText(input.id, 'id');
       const name = cleanText(input.name, 'name');
-      const baseUrl = cleanText(input.baseUrl, 'baseUrl');
+      const baseUrl = normalizeModelBaseUrl(cleanText(input.baseUrl, 'baseUrl'));
       const model = cleanText(input.model, 'model');
-      const protocol = input.protocol === 'custom' ? 'custom' : 'openai-compatible';
+      if (input.protocol && input.protocol !== 'openai-compatible') throw new Error('仅支持 OpenAI 兼容协议');
+      const protocol = 'openai-compatible';
       const savedProviders = repository.getSetting('model.providers', {});
       const previous = savedProviders[id] || defaultProviders.find((provider) => provider.id === id);
       const credentialRef = input.apiKey
@@ -133,7 +142,7 @@ export function createSettingsService({ repository, credentialStore }) {
       const savedProviders = repository.getSetting('model.providers', {});
       const activeId = repository.getSetting('model.activeId', 'openrouter');
       const base = defaultProviders.find((provider) => provider.id === activeId) || defaultProviders[0];
-      const profile = { ...base, ...(savedProviders[activeId] || {}) };
+      const profile = mergeProviderProfile(base, savedProviders[activeId]);
       return { ...profile, apiKey: credentialStore.get(profile.credentialRef) };
     },
   };
