@@ -1,23 +1,33 @@
 node_modules/
 data/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.xlsx
+*.csv
+*.eml
+*.mbox
 .env
+.env.*
+!.env.example
 .DS_Store
 npm-debug.log*
 data/.secrets/
 .playwright-mcp/
 *.png
-# README 展示截图例外（其他 *.png 仍忽略）
-!/assets/
-!/assets/*.png
-# 本地运行数据与内部文档，不上传远端仓库
-docs/
+# 内部材料保留在本地；仅发布通用工作流文档与维护脚本。
+docs/*
+!docs/workflow.md
 .workbuddy/
+.claude/
+.superpowers/
+scripts/*
+!scripts/check-aliases.mjs
+!scripts/reanalyze.mjs
 
 # 一次性评测与联调产物，不入库
 outputs/
+output/
+work/
 test-openrouter.mjs
-scripts/agent-a-triage-llm.mjs
-scripts/agent-b-full-llm.mjs
-scripts/agent-b-sampled.mjs
-scripts/agent-b-sampled-60.mjs
-scripts/replay-to-db.mjs

@@ -28,7 +28,7 @@ const cannedAnalysis = {
   needsReview: false,
 };
 
-async function startFixture() {
+async function startFixture({ messages, classify } = {}) {
   database = createDatabase(':memory:');
   const repository = createMessageRepository(database.db);
   const credentialStore = createCredentialStore();
@@ -38,7 +38,7 @@ async function startFixture() {
     analysisVersion: 'email-preview-test-v1',
   });
   const imapSource = {
-    fetchMessages: async () => [{
+    fetchMessages: async () => messages || [{
       provider: 'netease',
       folder: 'INBOX',
       uidValidity: '77',
@@ -53,7 +53,7 @@ async function startFixture() {
     }],
   };
   const createClassifier = async () => ({
-    classify: async () => cannedAnalysis,
+    classify: classify || (async () => cannedAnalysis),
   });
   const handler = createApi({
     config: { port: 0, analysisVersion: 'email-preview-test-v1' },
@@ -120,4 +120,38 @@ test('manual progress rows have no email body and return 404', async () => {
   assert.equal(manual.status, 200);
   const email = await request(fixture.baseUrl, `/api/progress/${manual.body.id}/email`);
   assert.equal(email.status, 404);
+});
+
+test('thread email history returns related messages newest first and excludes other applications', async () => {
+  const baseMessage = {
+    provider: 'netease', folder: 'INBOX', uidValidity: '77', sender: '招聘团队 <jobs@example.test>',
+    webUrl: 'https://email.163.com/', html: '',
+  };
+  const fixture = await startFixture({
+    messages: [
+      { ...baseMessage, uid: '11', messageId: '<a-1@test>', receivedAt: '2026-08-10T09:00:00.000Z', subject: '甲公司投递成功', text: '职位：产品经理\n已收到申请。' },
+      { ...baseMessage, uid: '12', messageId: '<other@test>', receivedAt: '2026-08-11T09:00:00.000Z', subject: '乙公司投递成功', text: '职位：算法工程师\n已收到申请。' },
+      { ...baseMessage, uid: '13', messageId: '<a-2@test>', receivedAt: '2026-08-12T09:00:00.000Z', subject: '甲公司面试邀请', text: '职位：产品经理\n请参加面试。' },
+    ],
+    classify: async ({ subject }) => subject.startsWith('乙')
+      ? { ...cannedAnalysis, company: '乙公司', position: '算法工程师', status: '已投递' }
+      : { ...cannedAnalysis, company: '甲公司', position: '产品经理', status: subject.includes('面试') ? '面试' : '已投递' },
+  });
+  await request(fixture.baseUrl, '/api/settings/mailbox', {
+    method: 'POST',
+    body: { provider: 'netease', email: 'candidate@163.com', authorizationCode: 'auth-code' },
+  });
+  await request(fixture.baseUrl, '/api/sync/run', {
+    method: 'POST',
+    body: { source: 'imap', from: '2026-08-01', to: '2026-08-31' },
+  });
+
+  const dashboard = await request(fixture.baseUrl, '/api/dashboard');
+  const thread = dashboard.body.recent.find((row) => row.company === '甲公司');
+  const history = await request(fixture.baseUrl, `/api/progress/${thread.id}/emails`);
+
+  assert.equal(history.status, 200);
+  assert.deepEqual(history.body.messages.map((item) => item.subject), ['甲公司面试邀请', '甲公司投递成功']);
+  assert.deepEqual(history.body.messages.map((item) => item.receivedAt), ['2026-08-12T09:00:00.000Z', '2026-08-10T09:00:00.000Z']);
+  assert.equal(JSON.stringify(history.body).includes('乙公司'), false);
 });

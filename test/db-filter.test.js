@@ -97,13 +97,13 @@ test('legacy mail messages are backfilled into application threads keeping the l
   const messages = [
     {
       messageKey: 'k-2026-03-01T00:00:00Z', accountId: 'a', provider: 'qq', folder: 'INBOX',
-      receivedAt: '2026-03-01T00:00:00Z', sender: 'hr@x.com', subject: '通知', contentHash: '2026-03-01T00:00:00Z', analysisVersion: 'v',
+      receivedAt: '2026-03-01T00:00:00Z', sender: 'hr@example.test', subject: '通知', contentHash: '2026-03-01T00:00:00Z', analysisVersion: 'v',
       analysis: { isJobRelated: true, company: '甲科技', position: '后端', status: '已投递', confidence: .9,
         evidence: 'e', nextAction: 'n', needsReview: false }, analyzedAt: '2026-03-01T00:00:00Z',
     },
     {
       messageKey: 'k-2026-04-10T00:00:00Z', accountId: 'a', provider: 'qq', folder: 'INBOX',
-      receivedAt: '2026-04-10T00:00:00Z', sender: 'hr@x.com', subject: '通知', contentHash: '2026-04-10T00:00:00Z', analysisVersion: 'v',
+      receivedAt: '2026-04-10T00:00:00Z', sender: 'hr@example.test', subject: '通知', contentHash: '2026-04-10T00:00:00Z', analysisVersion: 'v',
       analysis: { isJobRelated: true, company: '甲科技', position: '后端', status: '面试', confidence: .9,
         evidence: 'e', nextAction: 'n', needsReview: false }, analyzedAt: '2026-04-10T00:00:00Z',
     },
@@ -117,14 +117,14 @@ test('legacy mail messages are backfilled into application threads keeping the l
 test('backfill keeps one thread per company+position even when two mails share the exact same timestamp', () => {
   const mk = (key, status) => ({
     messageKey: key, accountId: 'a', provider: 'qq', folder: 'INBOX',
-    receivedAt: '2026-07-23T11:33:51.000Z', sender: 'hr@x.com', subject: '面试邀请反馈', contentHash: key, analysisVersion: 'v',
-    analysis: { isJobRelated: true, company: '腾讯', position: '产品策划', status, confidence: .9,
+    receivedAt: '2026-07-23T11:33:51.000Z', sender: 'hr@example.test', subject: '面试邀请反馈', contentHash: key, analysisVersion: 'v',
+    analysis: { isJobRelated: true, company: '示例网络', position: '产品策划', status, confidence: .9,
       evidence: 'e', nextAction: 'n', needsReview: false }, analyzedAt: '2026-07-23T11:33:51.000Z',
   });
   const repo = memoryRepoWithBackfill([mk('k-t1', '面试'), mk('k-t2', '面试')]);
   const threads = repo.listThreads({});
   assert.equal(threads.length, 1);
-  assert.equal(threads[0].company, '腾讯');
+  assert.equal(threads[0].company, '示例网络');
   assert.equal(threads[0].position, '产品策划');
   assert.equal(threads[0].latestReceivedAt, '2026-07-23T11:33:51.000Z');
 });
@@ -155,8 +155,8 @@ test('backfill rerun after deleting the marker does not accumulate duplicate thr
   const repo = createMessageRepository(database.db);
   const mk = (key) => ({
     messageKey: key, accountId: 'a', provider: 'qq', folder: 'INBOX',
-    receivedAt: '2026-05-01T00:00:00Z', sender: 'hr@x.com', subject: '投递成功 - 职位A', contentHash: key, analysisVersion: 'v',
-    analysis: { isJobRelated: true, company: '腾讯', position: '产品策划', status: '已投递', confidence: .9, evidence: 'e', nextAction: 'n', needsReview: false }, analyzedAt: '2026-05-01T00:00:00Z',
+    receivedAt: '2026-05-01T00:00:00Z', sender: 'hr@example.test', subject: '投递成功 - 职位A', contentHash: key, analysisVersion: 'v',
+    analysis: { isJobRelated: true, company: '示例网络', position: '产品策划', status: '已投递', confidence: .9, evidence: 'e', nextAction: 'n', needsReview: false }, analyzedAt: '2026-05-01T00:00:00Z',
   });
   repo.saveAnalysis(mk('k1'), undefined);
   repo.saveAnalysis(mk('k2'), undefined);
@@ -175,8 +175,8 @@ test('backfill drops orphan empty-position threads when the company has a named 
   const repo = createMessageRepository(database.db);
   const mk = (key, position, status, at) => ({
     messageKey: key, accountId: 'a', provider: 'qq', folder: 'INBOX',
-    receivedAt: at, sender: 'hr@x.com', subject: `通知-${key}`, contentHash: key, analysisVersion: 'v',
-    analysis: { isJobRelated: true, company: '腾讯', position, status, confidence: .9, evidence: 'e', nextAction: 'n', needsReview: false }, analyzedAt: at,
+    receivedAt: at, sender: 'hr@example.test', subject: `通知-${key}`, contentHash: key, analysisVersion: 'v',
+    analysis: { isJobRelated: true, company: '示例网络', position, status, confidence: .9, evidence: 'e', nextAction: 'n', needsReview: false }, analyzedAt: at,
   });
   // 6/23 产品策划面试 + 6/25 无岗位反馈问卷（同一公司）
   repo.saveAnalysis(mk('k-0623', '产品策划', '面试', '2026-06-23T14:16:00.000Z'), undefined);

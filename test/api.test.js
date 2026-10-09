@@ -46,7 +46,7 @@ function fakeImapSource() {
   };
 }
 
-async function startFixture({ withMailbox = false, withModel = true } = {}) {
+async function startFixture({ withMailbox = false, withModel = true, classify, checkConnection, syncTimeouts } = {}) {
   database = createDatabase(':memory:');
   const repository = createMessageRepository(database.db);
   const credentialStore = createCredentialStore();
@@ -58,7 +58,7 @@ async function startFixture({ withMailbox = false, withModel = true } = {}) {
   if (withMailbox) {
     settingsService.saveMailbox({ provider: 'qq', email: 'candidate@qq.com', authorizationCode: 'auth-code' });
   }
-  const config = { port: 0, analysisVersion: 'phase-9-api-test-v1' };
+  const config = { port: 0, analysisVersion: 'phase-9-api-test-v1', syncTimeouts };
   const handler = createApi({
     config,
     repository,
@@ -66,7 +66,7 @@ async function startFixture({ withMailbox = false, withModel = true } = {}) {
     settingsService,
     syncService,
     imapSource: fakeImapSource(),
-    createClassifier: withModel ? async () => ({ classify: async () => cannedAnalysis }) : async () => null,
+    createClassifier: withModel ? async () => ({ classify: classify || (async () => cannedAnalysis), checkConnection }) : async () => null,
   });
   server = http.createServer(handler);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -75,6 +75,32 @@ async function startFixture({ withMailbox = false, withModel = true } = {}) {
   const { port } = server.address();
   return { baseUrl: `http://127.0.0.1:${port}`, port, repository };
 }
+
+test('testing a model uses the configured provider without syncing mail or exposing credentials', async () => {
+  let probes = 0;
+  const f = await startFixture({ checkConnection: async () => { probes += 1; return { ok: true }; } });
+  const result = await request(f.baseUrl, '/api/model/test', { method: 'POST' });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.ok, true);
+  assert.equal(result.body.providerId, 'openrouter');
+  assert.equal(probes, 1);
+  assert.equal(f.repository.listThreads().length, 0);
+  assert.doesNotMatch(JSON.stringify(result.body), /apiKey|credential/);
+});
+
+test('model tests report unavailable endpoints and bound an unresponsive probe', async () => {
+  const f = await startFixture({ checkConnection: async () => { throw Object.assign(new Error('模型不可用（404）'), { code: 'MODEL_NOT_FOUND' }); } });
+  const missing = await request(f.baseUrl, '/api/model/test', { method: 'POST' });
+  assert.equal(missing.status, 502);
+  assert.equal(missing.body.code, 'MODEL_NOT_FOUND');
+});
+
+test('model tests bound a probe that ignores cancellation', async () => {
+  const f = await startFixture({ checkConnection: async () => new Promise(() => {}), syncTimeouts: { preflightMs: 20 } });
+  const result = await request(f.baseUrl, '/api/model/test', { method: 'POST' });
+  assert.equal(result.status, 504);
+  assert.equal(result.body.code, 'MODEL_PREFLIGHT_TIMEOUT');
+});
 
 async function request(baseUrl, path, options = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -154,6 +180,41 @@ test('sync without a configured model returns 503 MODEL_UNAVAILABLE', async () =
 
   assert.equal(response.status, 503);
   assert.equal(response.body.code, 'MODEL_UNAVAILABLE');
+});
+
+test('auto sync rewinds its watermark to retry a model failure on the next run', async () => {
+  let shouldFail = true;
+  const { baseUrl, repository } = await startFixture({
+    withMailbox: true,
+    classify: async () => {
+      // 消息里带 URL query 与凭据形态，用来验证 failures 返回给前端前已脱敏。
+      if (shouldFail) throw new TypeError('provider timeout calling https://api.example.com/v1/chat?token=supersecret Bearer sk-abcdef1234567890');
+      return cannedAnalysis;
+    },
+  });
+  repository.saveSetting('sync.watermark.candidate@qq.com', '2026-08-01T00:00:00.000Z');
+
+  const failed = await request(baseUrl, '/api/sync/run', { method: 'POST', body: { auto: true } });
+  assert.equal(failed.status, 200);
+  assert.equal(failed.body.modelFailed, 1);
+  // failures 会原样返回给前端，所以：
+  //   1) 逐字段断言，不 deepEqual 整个对象（记录会随诊断需要加字段）
+  //   2) 错误消息保留可诊断的措辞，但 URL query 与凭据不能漏到 UI 上
+  assert.equal(failed.body.failures.length, 1);
+  assert.equal(failed.body.failures[0].receivedAt, '2026-08-12T09:00:00.000Z');
+  assert.equal(failed.body.failures[0].subject, '示例科技面试邀请');
+  assert.equal(failed.body.failures[0].error, 'TypeError');
+  assert.match(failed.body.failures[0].message, /provider timeout/, '诊断措辞要保留');
+  assert.match(failed.body.failures[0].message, /api\.example\.com/, '保留 origin 够定位上游');
+  assert.doesNotMatch(JSON.stringify(failed.body.failures), /supersecret/, 'query 里的 token 不能漏');
+  assert.doesNotMatch(JSON.stringify(failed.body.failures), /sk-abcdef1234567890/, '凭据不能漏');
+  assert.equal(repository.getSetting('sync.watermark.candidate@qq.com'), '2026-08-12T08:59:59.999Z');
+
+  shouldFail = false;
+  const retried = await request(baseUrl, '/api/sync/run', { method: 'POST', body: { auto: true } });
+  assert.equal(retried.status, 200);
+  assert.equal(retried.body.analyzed, 1);
+  assert.equal(retried.body.modelFailed, 0);
 });
 
 test('sync without a configured mailbox returns 502 with MAILBOX_CONFIG code', async () => {
@@ -240,6 +301,7 @@ test('editing and deleting progress operates on threads and keeps the mail archi
   });
   assert.equal(updated.status, 200);
   assert.equal(updated.body.status, 'Offer');
+  assert.equal(updated.body.notes, '');
 
   const messageCountBefore = database.db.prepare('SELECT COUNT(*) AS count FROM mail_messages').get().count;
   assert.equal(messageCountBefore > 0, true);
@@ -253,6 +315,74 @@ test('editing and deleting progress operates on threads and keeps the mail archi
   assert.equal(messageCountAfter, messageCountBefore);
   const afterDelete = await request(baseUrl, '/api/dashboard');
   assert.equal(afterDelete.body.total, dashboard.body.total - 1);
+});
+
+test('manual progress API enforces the status-based notes whitelist', async () => {
+  const { baseUrl } = await startFixture({ withMailbox: false });
+  const created = await request(baseUrl, '/api/progress/manual', {
+    method: 'POST',
+    body: {
+      company: '示例公司',
+      position: '产品经理',
+      status: '已投递',
+      eventStart: '2026-09-11T02:00:00.000Z',
+      notes: '岗位未识别；感谢投递',
+    },
+  });
+  assert.equal(created.status, 200);
+  assert.equal(created.body.notes, '');
+
+  const assessment = await request(baseUrl, `/api/progress/${created.body.id}`, {
+    method: 'PUT',
+    body: {
+      company: '示例公司',
+      position: '产品经理',
+      status: '测评中',
+      eventStart: '2026-09-11T02:00:00.000Z',
+      eventEnd: '2026-09-12T15:59:00.000Z',
+      notes: '邮件原文；测评链接：https://assessment.example.test/manual；岗位未识别',
+    },
+  });
+  assert.equal(assessment.status, 200);
+  assert.equal(assessment.body.notes, '测评链接：https://assessment.example.test/manual；测评截止时间：2026-09-12 23:59');
+
+  const interview = await request(baseUrl, `/api/progress/${created.body.id}`, {
+    method: 'PUT',
+    body: {
+      company: '示例公司',
+      position: '产品经理',
+      status: '面试',
+      eventStart: '2026-09-13T02:00:00.000Z',
+      notes: '面试链接：https://meeting.example.test/room；下载链接：https://download.example.test/app',
+    },
+  });
+  assert.equal(interview.status, 200);
+  assert.equal(interview.body.notes, '面试链接：https://meeting.example.test/room');
+});
+
+test('editing an email-derived application to a different position records a manual position override', async () => {
+  const { baseUrl } = await startFixture({ withMailbox: true });
+  await request(baseUrl, '/api/sync/run', {
+    method: 'POST',
+    body: { from: '2026-08-01', to: '2026-08-31' },
+  });
+  const target = (await request(baseUrl, '/api/dashboard')).body.recent[0];
+
+  const updated = await request(baseUrl, `/api/progress/${target.id}`, {
+    method: 'PUT',
+    body: {
+      company: target.company,
+      position: '用户产品经理',
+      status: target.status,
+      eventStart: target.latestReceivedAt,
+      notes: '岗位由用户核对后修正',
+    },
+  });
+
+  assert.equal(updated.status, 200);
+  assert.equal(updated.body.position, '用户产品经理');
+  assert.equal(updated.body.manualPositionOverride, true);
+  assert.equal(updated.body.source, 'email');
 });
 
 test('mutating endpoints reject non-JSON content types (CSRF guard)', async () => {

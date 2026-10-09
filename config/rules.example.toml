@@ -1,0 +1,4 @@
+# Optional local aliases. Copy this file to data/rules.toml and fill in your own names.
+# The product works without data/rules.toml. No company aliases are bundled.
+[company_aliases]
+# "your own company alias" = "your preferred company name"

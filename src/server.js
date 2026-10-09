@@ -12,6 +12,7 @@ import { createMailboxService } from './services/mailbox-service.js';
 import { createImapSource } from './services/imap-source.js';
 import { createLlmClassifier } from './services/llm-service.js';
 import { bootstrapCredentials } from './services/credential-bootstrap.js';
+import { loadLocalRules } from './rules-config.js';
 
 const publicDirectory = resolve(fileURLToPath(new URL('../public', import.meta.url)));
 const contentTypes = {
@@ -57,26 +58,30 @@ export function createServer({ config = createConfig(), databasePath } = {}) {
   const repository = createMessageRepository(database.db);
   const credentialStore = createCredentialStore();
   const settingsService = createSettingsService({ repository, credentialStore });
-  const mailboxService = createMailboxService({ credentialStore });
-  const imapSource = createImapSource();
+  const mailboxService = createMailboxService({ timeouts: config.syncTimeouts });
+  const imapSource = createImapSource({ repository, analysisVersion: config.analysisVersion, timeouts: config.syncTimeouts });
   const syncService = createSyncService({
     repository,
     analysisVersion: config.analysisVersion,
+    messageTimeoutMs: config.syncTimeouts?.messageMs,
+    preflightTimeoutMs: config.syncTimeouts?.preflightMs,
   });
   const api = createApi({
     config,
     repository,
-    credentialStore,
     settingsService,
     syncService,
     imapSource,
     mailboxService,
-    createClassifier: () => {
+    createClassifier: async () => {
       const model = settingsService.getActiveModel();
-      if (!model.credentialRef && model.id !== 'ollama') return null;
+      if (model.credentialRequired !== false && !model.apiKey) return null;
+      const rules = await loadLocalRules(resolve(config.rulesFile || join(config.dataDir, 'rules.toml')));
       return createLlmClassifier({
         provider: model,
         credentialStore,
+        rules,
+        timeoutMs: config.syncTimeouts?.modelMs,
       });
     },
   });

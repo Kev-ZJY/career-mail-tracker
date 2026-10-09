@@ -8,12 +8,14 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "test": "node --test",
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch --watch-path=src src/server.js",
+    "test": "node --test \"test/*.test.js\"",
+    "check:aliases": "node scripts/check-aliases.mjs"
   },
   "dependencies": {
     "imapflow": "^1.7.1",
-    "mailparser": "^3.9.15"
+    "mailparser": "^3.9.15",
+    "html-to-text": "^10.0.0"
   }
 }

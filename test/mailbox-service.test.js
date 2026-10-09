@@ -44,3 +44,17 @@ test('mailbox service rejects unsupported providers before opening a connection'
   );
   assert.equal(called, false);
 });
+
+test('mailbox diagnostics honour the same proxy, TLS identity and budgets as sync', async () => {
+  let received;
+  const service = createMailboxService({
+    providerRegistry: () => ({ id: 'netease', host: '192.0.2.10', port: 993, secure: true, tlsServername: 'imap.163.com' }),
+    env: { IMAP_PROXY: 'socks5://127.0.0.1:1080' }, timeouts: { connectMs: 50, fetchMs: 75 },
+    clientFactory: (options) => { received = options; return { connect: async () => {}, logout: async () => {} }; },
+  });
+  assert.equal((await service.testConnection({ provider: 'netease', email: 'fixture@example.test', authorizationCode: 'fixture' })).ok, true);
+  assert.equal(received.proxy, 'socks5://127.0.0.1:1080');
+  assert.equal(received.tls.servername, 'imap.163.com');
+  assert.equal(received.connectionTimeout, 50);
+  assert.equal(received.socketTimeout, 75);
+});

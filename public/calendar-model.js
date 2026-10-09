@@ -49,3 +49,22 @@ export function formatTime(value) {
   const date = new Date(value);
   return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
+
+export function formatEmailTabLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '--';
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+  return `${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
+}
+
+export function formatSenderDisplay(value) {
+  const displayName = String(value || '').replace(/\s*<[^>]*>/g, '').trim();
+  return displayName || '招聘团队';
+}

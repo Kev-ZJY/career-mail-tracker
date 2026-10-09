@@ -25,7 +25,7 @@ test('the recruitment workspace exposes the calendar-first progress contract', (
   assert.doesNotMatch(indexHtml, /class="overview-strip"/);
   assert.match(indexHtml, /class="table-col-company"/);
   assert.match(indexHtml, /class="table-col-position"/);
-  assert.match(indexHtml, /保存后点击同步并分析将连接真实 QQ\/网易 IMAP/);
+  assert.match(indexHtml, /保存后点击同步并分析将连接真实 QQ\s*\/\s*网易 IMAP/);
   assert.doesNotMatch(indexHtml, /真实 QQ \/ 网易 IMAP 连接将在下一阶段接入/);
   assert.doesNotMatch(indexHtml, /value="待确认"|value="拒绝"|<option value="筛选中">/);
   assert.match(stylesCss, /table-layout:fixed/);
@@ -36,7 +36,8 @@ test('the dashboard renders three panels on one screen without a hero banner', (
   assert.doesNotMatch(indexHtml, /招聘进度，/);
   assert.match(indexHtml, /class="dashboard-grid"/);
   assert.match(indexHtml, /id="mailboxLabel"/);
-  assert.match(indexHtml, /id="lastSyncLabel"/);
+  assert.doesNotMatch(indexHtml, /id="lastSyncLabel"|id="syncDetail"/);
+  assert.doesNotMatch(appJs, /lastSyncLabel|syncDetail/);
   assert.match(stylesCss, /\.dashboard-grid\{/);
 });
 
@@ -50,6 +51,8 @@ test('the settings dialog uses a plain provider list without redundant cards', (
 test('topbar is decluttered and toast sits top-center', () => {
   assert.doesNotMatch(indexHtml, /topbar-middle/);
   assert.doesNotMatch(indexHtml, /招聘追踪<\/span>/);
+  assert.doesNotMatch(indexHtml, /id="refreshButton"/);
+  assert.doesNotMatch(appJs, /refreshButton/);
   assert.match(indexHtml, /rel="icon"/);
   assert.match(stylesCss, /\.notice\{[^}]*top:20px;left:50%;transform:translateX\(-50%\)/);
   assert.match(stylesCss, /@keyframes spin/);
@@ -61,10 +64,40 @@ test('the front end consumes application-thread rows instead of per-message rows
   assert.match(appJs, /data-email-id="\$\{row\.latestMessageId\}"/);
   assert.match(appJs, /latestMessageId == null/);
   assert.match(appJs, /手动记录/);
-  // 邮件正文请求按 latestMessageId 走既有 GET /api/progress/:id/email
-  assert.match(appJs, /\/api\/progress\/\$\{row\.latestMessageId\}\/email/);
+  // 邮件正文按线程读取完整历史，默认展示最新一封。
+  assert.match(indexHtml, /id="emailHistoryTabs"/);
+  assert.match(appJs, /\/api\/progress\/\$\{row\.id\}\/emails/);
+  assert.match(appJs, /formatEmailTabLabel/);
+  assert.match(appJs, /data-email-history-index/);
+  assert.match(stylesCss, /\.email-history-tabs\{/);
   // 编辑提交走 PUT /api/progress/:id 线程接口
   assert.match(appJs, /method: 'PUT'/);
   // 事件窗口兼容线程行的 latestReceivedAt 字段
   assert.match(appJs, /row\.latestReceivedAt/);
+});
+
+test('the email reader keeps compact single-line metadata without mailbox actions', () => {
+  assert.doesNotMatch(indexHtml, /id="openMailboxLink"/);
+  assert.doesNotMatch(indexHtml, /id="emailLinkHint"/);
+  assert.doesNotMatch(indexHtml, /class="email-reader-actions"/);
+  assert.doesNotMatch(appJs, /openMailboxLink|emailLinkHint/);
+  assert.match(stylesCss, /\.email-meta>div\{[^}]*min-width:0/);
+  assert.match(stylesCss, /\.email-meta strong\{[^}]*white-space:nowrap;[^}]*overflow:hidden;[^}]*text-overflow:ellipsis/);
+});
+
+test('the sync notice distinguishes rate exhaustion from a broken model configuration', () => {
+  assert.match(appJs, /failure\.error === 'MODEL_RATE_LIMITED'/);
+  assert.match(appJs, /未处理邮件会在下次同步时继续分析/);
+});
+
+test('mailbox status exposes streaming progress and cancellation', () => {
+  assert.match(indexHtml, /id="mailboxLabel"[\s\S]*id="mailboxSync"/);
+  assert.match(indexHtml, /id="syncStatus"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(indexHtml, /id="syncProgress"/);
+  assert.doesNotMatch(indexHtml, /id="cancelSyncButton"/);
+  assert.doesNotMatch(appJs, /cancelSyncButton/);
+  assert.match(indexHtml, /id="syncNowButton"/);
+  assert.match(appJs, /readSyncStream\(\{/);
+  assert.match(appJs, /Agent解析进度：/);
+  assert.match(appJs, /controller\.signal/);
 });
